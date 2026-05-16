@@ -1,0 +1,27 @@
+# Hermes provider config for spark-llm-stack
+# Add these providers to ~/.hermes/config.yaml
+
+providers:
+  local-coder-mtp:
+    api: http://127.0.0.1:8152/v1
+    default_model: qwen3.6-27b-mtp-coder
+    name: Coder - Qwen3.6 27B Dense
+    models:
+    - qwen3.6-27b-mtp-coder
+    extra_body:
+      max_tokens: 4096
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+
+  local-agent-mtp:
+    api: http://127.0.0.1:8154/v1
+    default_model: qwen3.6-35b-a3b-mtp
+    name: Architect - Qwen3.6 35B MoE
+    models:
+    - qwen3.6-35b-a3b-mtp
+    extra_body:
+      max_tokens: 4096
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 20

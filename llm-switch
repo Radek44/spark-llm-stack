@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# llm-switch — load/unload llama services on demand
+# Usage:
+#   llm-switch coder        # stop architect, ensure coder running
+#   llm-switch architect    # stop coder, ensure architect running
+#   llm-switch both         # run both (shared memory, some contention)
+#   llm-switch off          # stop both
+#   llm-switch status       # show what's running
+
+set -euo pipefail
+
+CODER_SVC="qwen27-mtp.service"
+ARCH_SVC="qwen35-mtp.service"
+CODER_PORT=8152
+ARCH_PORT=8154
+WAIT_TIMEOUT=120  # seconds to wait for model load
+
+wait_ready() {
+  local port=$1
+  local name=$2
+  local elapsed=0
+  echo -n "  waiting for $name on :$port"
+  while ! curl -sf http://127.0.0.1:$port/health > /dev/null 2>&1; do
+    sleep 2; elapsed=$((elapsed+2))
+    echo -n "."
+    if [ $elapsed -ge $WAIT_TIMEOUT ]; then
+      echo " TIMEOUT — check: journalctl --user -fu $name"
+      exit 1
+    fi
+  done
+  echo " ready (${elapsed}s)"
+}
+
+svc_running() {
+  systemctl --user is-active "$1" > /dev/null 2>&1
+}
+
+show_status() {
+  echo ""
+  for svc in $CODER_SVC $ARCH_SVC; do
+    state=$(systemctl --user is-active $svc 2>/dev/null || echo "unknown")
+    printf "  %-30s %s\n" "$svc" "$state"
+  done
+  echo ""
+  free -h | awk '/Mem:/{printf "  memory: %s used / %s total / %s available\n", $3, $2, $7}'
+  echo ""
+}
+
+CMD="${1:-status}"
+
+case "$CMD" in
+  coder)
+    echo "→ switching to coder mode"
+    if svc_running $ARCH_SVC; then
+      echo "  stopping architect..."
+      systemctl --user stop $ARCH_SVC
+      sleep 3
+    fi
+    if ! svc_running $CODER_SVC; then
+      echo "  starting coder..."
+      systemctl --user start $CODER_SVC
+      wait_ready $CODER_PORT $CODER_SVC
+    else
+      echo "  coder already running"
+    fi
+    show_status
+    ;;
+  architect)
+    echo "→ switching to architect mode"
+    if svc_running $CODER_SVC; then
+      echo "  stopping coder..."
+      systemctl --user stop $CODER_SVC
+      sleep 3
+    fi
+    if ! svc_running $ARCH_SVC; then
+      echo "  starting architect..."
+      systemctl --user start $ARCH_SVC
+      wait_ready $ARCH_PORT $ARCH_SVC
+    else
+      echo "  architect already running"
+    fi
+    show_status
+    ;;
+  both)
+    echo "→ starting both (expect some memory bandwidth sharing)"
+    if ! svc_running $CODER_SVC; then
+      systemctl --user start $CODER_SVC
+      wait_ready $CODER_PORT $CODER_SVC
+    fi
+    if ! svc_running $ARCH_SVC; then
+      systemctl --user start $ARCH_SVC
+      wait_ready $ARCH_PORT $ARCH_SVC
+    fi
+    show_status
+    ;;
+  off)
+    echo "→ stopping all llm services"
+    systemctl --user stop $CODER_SVC $ARCH_SVC 2>/dev/null || true
+    sleep 3
+    show_status
+    ;;
+  status)
+    show_status
+    ;;
+  *)
+    echo "usage: llm-switch [coder|architect|both|off|status]"
+    exit 1
+    ;;
+esac

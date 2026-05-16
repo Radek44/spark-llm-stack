@@ -1,0 +1,56 @@
+[Unit]
+Description=Qwen3.6 27B MTP Coder on 8152
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="CUDA_SCALE_LAUNCH_QUEUES=4x"
+Environment="GGML_CUDA_GRAPH_OPT=1"
+Environment="GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1"
+
+ExecStart=/home/radek/src/llama.cpp-mtp/build/bin/llama-server \
+  -hf unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
+  --alias qwen3.6-27b-coder \
+  --host 127.0.0.1 \
+  --port 8152 \
+  -ngl 999 \
+  -fa on \
+  -c 131072 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --kv-unified \
+  --cache-ram 32768 \
+  --cache-idle-slots \
+  --ctx-checkpoints 128 \
+  --cache-reuse 1024 \
+  -b 32768 \
+  -ub 4096 \
+  --parallel 1 \
+  --threads 8 \
+  --threads-batch 16 \
+  --threads-http 4 \
+  --prio 3 \
+  --poll 100 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 5 \
+  --spec-draft-n-min 1 \
+  --spec-draft-p-min 0.75 \
+  --no-mmap \
+  --reasoning off \
+  --jinja \
+  --temp 0.6 \
+  --top-k 20 \
+  --top-p 0.95 \
+  --min-p 0.0 \
+  --presence-penalty 0.0 \
+  --keep -1 \
+  --metrics \
+  --slots
+
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target
