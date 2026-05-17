@@ -148,3 +148,17 @@ the pre-merge fork at commit `08b147428` on GB10:
 
 We are using the fork until the regression is resolved upstream.
 Watch commits touching `src/llama-mtp.cpp` for fixes.
+
+## Binary note (May 2026)
+
+MTP merged into llama.cpp mainline on May 16, 2026 (PR #22673).
+However, benchmarking shows the mainline binary currently underperforms
+the pre-merge fork at commit `08b147428` on GB10:
+
+| Binary | tg t/s | MTP acceptance |
+|---|---|---|
+| Fork `08b147428` | 28–30 | 75% |
+| Mainline post-merge | 23 | 54% |
+
+We are using the fork until the regression is resolved upstream.
+Watch commits touching `src/llama-mtp.cpp` for fixes.
