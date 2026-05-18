@@ -16,11 +16,11 @@ ExecStart=/home/radek/src/llama.cpp-mtp/build/bin/llama-server \
   --port 8152 \
   -ngl 999 \
   -fa on \
-  -c 131072 \
+  -c 262144 \
   --cache-type-k q8_0 \
   --cache-type-v q8_0 \
   --kv-unified \
-  --cache-ram 32768 \
+  --cache-ram 49152 \
   --cache-idle-slots \
   --ctx-checkpoints 128 \
   --cache-reuse 1024 \

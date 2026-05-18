@@ -162,3 +162,33 @@ the pre-merge fork at commit `08b147428` on GB10:
 
 We are using the fork until the regression is resolved upstream.
 Watch commits touching `src/llama-mtp.cpp` for fixes.
+
+## Benchmark results (May 2026, GB10, exclusive operation)
+
+Measured with greedy decoding (temp=0, deterministic), 8 timed runs after 6 warmup runs.
+
+### 27B coder
+| metric | value |
+|---|---|
+| tg t/s avg | 23.9 |
+| tg t/s stdev | 0.6 |
+| MTP acceptance avg | 66.5% |
+| prefill avg | 110 t/s |
+
+### 35B architect
+| metric | value |
+|---|---|
+| tg t/s avg | 59.9 |
+| tg t/s stdev | 3.5 (still warming, trending up) |
+| MTP acceptance avg | 64.8% |
+| prefill avg | 349 t/s |
+
+### Memory profile
+- 27B resident: ~61 GB
+- 35B resident: ~48 GB
+- Model switch (llm-switch): clean eviction, 8 GB floor between loads
+- Swap: 3 GB constant (OS, not model pressure)
+
+### Binary
+Both services run `ggml-org/llama.cpp` branch `qwen-mtp` at commit `08b147428` (version 9172).
+Mainline post-merge tested and found ~20% slower on GB10 — tracking upstream for fixes.
