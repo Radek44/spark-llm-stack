@@ -1,45 +1,64 @@
 #!/usr/bin/env bash
-# llm-switch — load/unload llama services on demand
-# Usage:
-#   llm-switch coder        # stop architect, ensure coder running
-#   llm-switch architect    # stop coder, ensure architect running
-#   llm-switch both         # run both (shared memory, some contention)
-#   llm-switch off          # stop both
-#   llm-switch status       # show what's running
+# llm-switch — model roster for DGX Spark GB10
+# usage: llm-switch [coder|architect|gemma|vision|imagine|gptoss|both|off|status]
 
 set -euo pipefail
 
-CODER_SVC="qwen27-mtp.service"
-ARCH_SVC="qwen35-mtp.service"
-CODER_PORT=8152
-ARCH_PORT=8154
-WAIT_TIMEOUT=120  # seconds to wait for model load
+declare -A SVCS=(
+  [coder]="qwen27-mtp.service"
+  [architect]="qwen35-mtp.service"
+  [gemma]="gemma-31b.service"
+  [vision]="gemma-vision.service"
+  [imagine]="flux-klein.service"
+  [gptoss]="gptoss-20b.service"
+)
+declare -A PORTS=(
+  [coder]=8152 [architect]=8154 [gemma]=8156
+  [vision]=8155 [imagine]=8160 [gptoss]=8157
+)
+declare -A ROLES=(
+  [coder]="qwen3.6-27B    fast coding, MTP 70%+"
+  [architect]="qwen3.6-35B    deep reasoning, MoE"
+  [gemma]="gemma4-31B     alt reasoning + image input"
+  [vision]="gemma4-E4B     fast vision + audio input"
+  [imagine]="flux.2-klein   image generation"
+  [gptoss]="gpt-oss-20B    fast general, OpenAI style"
+)
+WAIT_TIMEOUT=300
 
 wait_ready() {
-  local port=$1
-  local name=$2
-  local elapsed=0
-  echo -n "  waiting for $name on :$port"
-  while ! curl -sf http://127.0.0.1:$port/health > /dev/null 2>&1; do
-    sleep 2; elapsed=$((elapsed+2))
-    echo -n "."
-    if [ $elapsed -ge $WAIT_TIMEOUT ]; then
-      echo " TIMEOUT — check: journalctl --user -fu $name"
-      exit 1
-    fi
+  local slot=$1 port=${PORTS[$1]} elapsed=0
+  echo -n "  waiting for $slot on :$port"
+  while ! curl -sf http://127.0.0.1:$port/health > /dev/null 2>&1 && ! curl -sf http://127.0.0.1:$port/sdcpp/v1/capabilities > /dev/null 2>&1; do
+    sleep 2; elapsed=$((elapsed+2)); echo -n "."
+    [ $elapsed -ge $WAIT_TIMEOUT ] && { echo " TIMEOUT"; exit 1; }
   done
   echo " ready (${elapsed}s)"
 }
 
-svc_running() {
-  systemctl --user is-active "$1" > /dev/null 2>&1
+svc_running() { systemctl --user is-active "$1" > /dev/null 2>&1; }
+
+stop_all_except() {
+  local keep="$1"
+  for slot in "${!SVCS[@]}"; do
+    local svc="${SVCS[$slot]}"
+    if [ "$svc" != "$keep" ] && svc_running "$svc"; then
+      echo "  stopping $slot..."
+      systemctl --user stop "$svc"
+    fi
+  done
+  sleep 3
 }
 
 show_status() {
   echo ""
-  for svc in $CODER_SVC $ARCH_SVC; do
-    state=$(systemctl --user is-active $svc 2>/dev/null || echo "unknown")
-    printf "  %-30s %s\n" "$svc" "$state"
+  printf "  %-10s %-28s %-10s %s\n" "slot" "service" "state" "role"
+  printf "  %-10s %-28s %-10s %s\n" "──────────" "──────────────────────────" "─────────" "──────────────────────────────"
+  for slot in coder architect gemma vision imagine gptoss; do
+    local svc="${SVCS[$slot]}"
+    local port="${PORTS[$slot]}"
+    local state=$(systemctl --user is-active "$svc" 2>/dev/null || echo "inactive")
+    printf "  %-10s %-28s %-10s %s\n" "$slot" "$svc (:$port)" "$state" "${ROLES[$slot]}"
   done
   echo ""
   free -h | awk '/Mem:/{printf "  memory: %s used / %s total / %s available\n", $3, $2, $7}'
@@ -49,61 +68,40 @@ show_status() {
 CMD="${1:-status}"
 
 case "$CMD" in
-  coder)
-    echo "→ switching to coder mode"
-    if svc_running $ARCH_SVC; then
-      echo "  stopping architect..."
-      systemctl --user stop $ARCH_SVC
-      sleep 3
-    fi
-    if ! svc_running $CODER_SVC; then
-      echo "  starting coder..."
-      systemctl --user start $CODER_SVC
-      wait_ready $CODER_PORT $CODER_SVC
+  coder|architect|gemma|vision|imagine|gptoss)
+    local_svc="${SVCS[$CMD]}"
+    echo "→ $CMD mode (${ROLES[$CMD]})"
+    stop_all_except "$local_svc"
+    if ! svc_running "$local_svc"; then
+      systemctl --user start "$local_svc"
+      wait_ready "$CMD"
     else
-      echo "  coder already running"
-    fi
-    show_status
-    ;;
-  architect)
-    echo "→ switching to architect mode"
-    if svc_running $CODER_SVC; then
-      echo "  stopping coder..."
-      systemctl --user stop $CODER_SVC
-      sleep 3
-    fi
-    if ! svc_running $ARCH_SVC; then
-      echo "  starting architect..."
-      systemctl --user start $ARCH_SVC
-      wait_ready $ARCH_PORT $ARCH_SVC
-    else
-      echo "  architect already running"
+      echo "  already running"
     fi
     show_status
     ;;
   both)
-    echo "→ starting both (expect some memory bandwidth sharing)"
-    if ! svc_running $CODER_SVC; then
-      systemctl --user start $CODER_SVC
-      wait_ready $CODER_PORT $CODER_SVC
-    fi
-    if ! svc_running $ARCH_SVC; then
-      systemctl --user start $ARCH_SVC
-      wait_ready $ARCH_PORT $ARCH_SVC
-    fi
+    echo "→ coder + architect"
+    for slot in coder architect; do
+      if ! svc_running "${SVCS[$slot]}"; then
+        systemctl --user start "${SVCS[$slot]}"
+        wait_ready "$slot"
+      fi
+    done
     show_status
     ;;
   off)
-    echo "→ stopping all llm services"
-    systemctl --user stop $CODER_SVC $ARCH_SVC 2>/dev/null || true
-    sleep 3
-    show_status
+    echo "→ stopping all"
+    for slot in "${!SVCS[@]}"; do
+      systemctl --user stop "${SVCS[$slot]}" 2>/dev/null || true
+    done
+    sleep 3; show_status
     ;;
   status)
     show_status
     ;;
   *)
-    echo "usage: llm-switch [coder|architect|both|off|status]"
+    echo "usage: llm-switch [coder|architect|gemma|vision|imagine|gptoss|both|off|status]"
     exit 1
     ;;
 esac

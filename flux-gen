@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# flux-gen — quick image generation from CLI
+# Usage: flux-gen "prompt" [width] [height] [steps] [seed]
+# Example: flux-gen "pixel art sword icon, white background" 512 512 4 42
+
+PROMPT="${1:-a beautiful landscape}"
+WIDTH="${2:-512}"
+HEIGHT="${3:-512}"
+STEPS="${4:-4}"
+SEED="${5:--1}"
+BASE="http://127.0.0.1:8160"
+OUTDIR=~/flux-output
+mkdir -p "$OUTDIR"
+
+# Check server
+curl -sf "$BASE/sdcpp/v1/capabilities" > /dev/null 2>&1 || {
+  echo "FLUX server not running — start with: llm-switch imagine"
+  exit 1
+}
+
+echo "Generating: $PROMPT"
+echo "Size: ${WIDTH}x${HEIGHT}  Steps: $STEPS  Seed: $SEED"
+
+python3 << PYEOF
+import requests, time, json, base64, os
+
+BASE = "$BASE"
+payload = {
+    "prompt": "$PROMPT",
+    "width": $WIDTH,
+    "height": $HEIGHT,
+    "batch_count": 1,
+    "seed": $SEED,
+    "sample_params": {
+        "sample_steps": $STEPS,
+        "sample_method": "euler",
+        "guidance": {"txt_cfg": 1.0, "distilled_guidance": 3.5}
+    }
+}
+
+r = requests.post(f"{BASE}/sdcpp/v1/img_gen", json=payload)
+job = r.json()
+job_id = job["id"]
+print(f"Job: {job_id}")
+
+start = time.time()
+while True:
+    time.sleep(0.5)
+    r = requests.get(f"{BASE}/sdcpp/v1/jobs/{job_id}")
+    job = r.json()
+    status = job.get("status")
+    if status in ("completed", "failed", "cancelled"):
+        break
+
+elapsed = time.time() - start
+if status == "completed":
+    images = job.get("result", {}).get("images", [])
+    if images:
+        img = base64.b64decode(images[0]["b64_json"])
+        fname = f"$OUTDIR/flux-{int(time.time())}.png"
+        with open(fname, "wb") as f:
+            f.write(img)
+        print(f"Done in {elapsed:.1f}s — {fname}  ({len(img)/1024:.0f}KB)")
+    else:
+        print("No images:", job.get("result"))
+else:
+    print(f"Failed: {job.get('error')}")
+PYEOF

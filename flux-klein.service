@@ -1,0 +1,25 @@
+[Unit]
+Description=FLUX.2-klein Image Gen on 8160
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="CUDA_SCALE_LAUNCH_QUEUES=4x"
+
+ExecStart=/home/radek/src/stable-diffusion.cpp/build/bin/sd-server \
+  --diffusion-model /home/radek/models/flux2-klein/flux-2-klein-4b.safetensors \
+  --llm /home/radek/models/flux2-klein/text_encoder/qwen_3_4b.safetensors \
+  --vae /home/radek/models/flux2-klein/ae.safetensors \
+  --listen-ip 127.0.0.1 \
+  --listen-port 8160 \
+  --diffusion-fa \
+  --type f16 \
+  --threads 8
+
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target

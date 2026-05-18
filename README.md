@@ -192,3 +192,27 @@ Measured with greedy decoding (temp=0, deterministic), 8 timed runs after 6 warm
 ### Binary
 Both services run `ggml-org/llama.cpp` branch `qwen-mtp` at commit `08b147428` (version 9172).
 Mainline post-merge tested and found ~20% slower on GB10 — tracking upstream for fixes.
+
+
+## FLUX.2-klein image generation
+
+FLUX.2-klein 4B (Apache 2.0) via stable-diffusion.cpp for local image generation.
+
+**Model files (~17GB total):**
+- `flux-2-klein-4b.safetensors` — diffusion model (~8GB)
+- `text_encoder/qwen_3_4b.safetensors` — merged Qwen3-4B encoder (~8GB)
+- `ae.safetensors` — VAE (~335MB)
+
+**Build:**
+Build stable-diffusion.cpp with `-DSD_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=121 -DSD_FLASH_ATTN=ON`
+See full build instructions in the repo.
+
+**API** — async job system, not OpenAI-compatible:
+- `POST /sdcpp/v1/img_gen` — submit job, returns job ID
+- `GET /sdcpp/v1/jobs/{id}` — poll until completed, get b64_json images
+
+**CLI:** `flux-gen "prompt" [width] [height] [steps] [seed]`
+
+**Performance:** 4 steps, sub-10s on GB10, 15GB VRAM
+
+**Note:** Use `llm-switch imagine` to load. Health endpoint is `/sdcpp/v1/capabilities` not `/health`.
