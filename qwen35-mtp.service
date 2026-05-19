@@ -17,24 +17,23 @@ ExecStart=/home/radek/src/llama.cpp-mtp/build/bin/llama-server \
   -ngl 999 \
   -fa on \
   -c 262144 \
-  --cache-type-k f16 \
-  --cache-type-v f16 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
   --kv-unified \
-  --cache-ram 32768 \
+  --cache-ram 49152 \
+  --cache-idle-slots \
   --ctx-checkpoints 64 \
   --cache-reuse 1024 \
   -b 16384 \
-  -ub 2048 \
+  -ub 4096 \
   --parallel 1 \
   --threads 8 \
-  --threads-batch 12 \
+  --cpu-range 0-9 \
+  --threads-batch 16 \
+  --cpu-range-batch 10-19 \
   --threads-http 4 \
   --prio 2 \
   --poll 50 \
-  --spec-type draft-mtp \
-  --spec-draft-n-max 2 \
-  --spec-draft-n-min 1 \
-  --spec-draft-p-min 0.8 \
   --no-mmap \
   --reasoning on \
   --reasoning-budget 4000 \
@@ -44,7 +43,7 @@ ExecStart=/home/radek/src/llama.cpp-mtp/build/bin/llama-server \
   --top-k 20 \
   --top-p 0.95 \
   --min-p 0.0 \
-  --presence-penalty 1.5 \
+  --presence-penalty 0.5 \
   --keep -1 \
   --metrics \
   --slots

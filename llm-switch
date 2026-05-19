@@ -11,6 +11,7 @@ declare -A SVCS=(
   [vision]="gemma-vision.service"
   [imagine]="flux-klein.service"
   [gptoss]="gptoss-20b.service"
+  [comfyui]="comfyui.service"
 )
 declare -A PORTS=(
   [coder]=8152 [architect]=8154 [gemma]=8156
@@ -23,13 +24,14 @@ declare -A ROLES=(
   [vision]="gemma4-E4B     fast vision + audio input"
   [imagine]="flux.2-klein   image generation"
   [gptoss]="gpt-oss-20B    fast general, OpenAI style"
+  [comfyui]="ComfyUI        diffusion UI + workflows"
 )
 WAIT_TIMEOUT=300
 
 wait_ready() {
   local slot=$1 port=${PORTS[$1]} elapsed=0
   echo -n "  waiting for $slot on :$port"
-  while ! curl -sf http://127.0.0.1:$port/health > /dev/null 2>&1 && ! curl -sf http://127.0.0.1:$port/sdcpp/v1/capabilities > /dev/null 2>&1; do
+  while ! curl -sf http://127.0.0.1:$port/health > /dev/null 2>&1 && ! curl -sf http://127.0.0.1:$port/sdcpp/v1/capabilities > /dev/null 2>&1 && ! curl -sf http://127.0.0.1:$port/ > /dev/null 2>&1; do
     sleep 2; elapsed=$((elapsed+2)); echo -n "."
     [ $elapsed -ge $WAIT_TIMEOUT ] && { echo " TIMEOUT"; exit 1; }
   done
@@ -68,7 +70,7 @@ show_status() {
 CMD="${1:-status}"
 
 case "$CMD" in
-  coder|architect|gemma|vision|imagine|gptoss)
+  coder|architect|gemma|vision|imagine|gptoss|comfyui)
     local_svc="${SVCS[$CMD]}"
     echo "→ $CMD mode (${ROLES[$CMD]})"
     stop_all_except "$local_svc"
@@ -101,7 +103,7 @@ case "$CMD" in
     show_status
     ;;
   *)
-    echo "usage: llm-switch [coder|architect|gemma|vision|imagine|gptoss|both|off|status]"
+    echo "usage: llm-switch [coder|architect|gemma|vision|imagine|gptoss|comfyui|both|off|status]"
     exit 1
     ;;
 esac
