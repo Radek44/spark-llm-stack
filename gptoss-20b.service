@@ -1,5 +1,5 @@
 [Unit]
-Description=Qwen3.6 27B MTP Coder on 8152
+Description=GPT-OSS 20B General on 8157
 After=network-online.target
 Wants=network-online.target
 
@@ -10,39 +10,34 @@ Environment="GGML_CUDA_GRAPH_OPT=1"
 Environment="GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1"
 
 ExecStart=/home/radek/src/llama.cpp-mtp/build/bin/llama-server \
-  -hf unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
-  --alias qwen3.6-27b-coder \
+  --gpt-oss-20b-default \
+  --alias gpt-oss-20b \
   --host 127.0.0.1 \
-  --port 8152 \
+  --port 8157 \
   -ngl 999 \
   -fa on \
-  -c 262144 \
+  -c 131072 \
   --cache-type-k q8_0 \
   --cache-type-v q8_0 \
   --kv-unified \
-  --cache-ram 49152 \
+  --cache-ram 16384 \
   --cache-idle-slots \
-  --ctx-checkpoints 128 \
-  --cache-reuse 1024 \
-  -b 32768 \
-  -ub 8192 \
+  --cache-reuse 512 \
+  -b 16384 \
+  -ub 4096 \
   --parallel 1 \
   --threads 8 \
+  --cpu-range 0-9 \
   --threads-batch 16 \
+  --cpu-range-batch 10-19 \
   --threads-http 4 \
-  --prio 3 \
-  --poll 100 \
-  --spec-type draft-mtp \
-  --spec-draft-n-max 5 \
-  --spec-draft-n-min 1 \
-  --spec-draft-p-min 0.75 \
-  --reasoning off \
+  --prio 2 \
+  --poll 50 \
   --jinja \
-  --temp 0.6 \
-  --top-k 20 \
+  --temp 0.7 \
+  --top-k 40 \
   --top-p 0.95 \
   --min-p 0.0 \
-  --presence-penalty 0.0 \
   --keep -1 \
   --metrics \
   --slots

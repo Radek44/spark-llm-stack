@@ -216,3 +216,38 @@ See full build instructions in the repo.
 **Performance:** 4 steps, sub-10s on GB10, 15GB VRAM
 
 **Note:** Use `llm-switch imagine` to load. Health endpoint is `/sdcpp/v1/capabilities` not `/health`.
+
+
+## ⚠️ Production hardening (read before enabling services)
+
+This stack runs heavyweight models on a 121GB unified memory host. Six services
+enabled simultaneously = OOM brick loop. Learned the hard way — see [POSTMORTEM.md](POSTMORTEM.md).
+
+### Rules
+
+1. **Never `systemctl --user enable` more than one heavyweight service** without
+   setting a boot-default via `llm-switch boot-default <slot>`.
+2. **Always use `llm-switch`** — it enforces mutual exclusion at runtime.
+3. **Check before rebooting:** `llm-switch boot-status`
+
+### Per-service memory caps (drop-ins)
+
+Each service has a drop-in in `drop-ins/<service>.service.d/override.conf` with:
+- `MemoryMax` — hard ceiling (OOM kills the cgroup, not the host)
+- `OOMPolicy=stop` — OOM = deliberate halt, not respawn loop
+- `Conflicts=` — systemd-level mutual exclusion
+
+### Key flag notes
+
+- `--no-mmap` was **removed** from all services — on unified memory, page cache
+  eviction is the kernel's best pressure-relief valve; bypassing it is harmful.
+- `--mlock` was **removed** — pins 50GB+ in RAM permanently, starves other services.
+- `--cache-ram` is sized conservatively — 256K context is rarely needed day-to-day.
+
+### llm-switch boot commands
+
+```bash
+llm-switch boot-status              # what autostarts at boot?
+llm-switch boot-default architect   # set one slot as boot default
+llm-switch boot-safe                # disable all model autostart
+```

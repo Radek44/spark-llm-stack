@@ -34,7 +34,6 @@ ExecStart=/home/radek/src/llama.cpp-mtp/build/bin/llama-server \
   --threads-http 4 \
   --prio 2 \
   --poll 50 \
-  --no-mmap \
   --reasoning on \
   --reasoning-budget 4000 \
   --reasoning-format deepseek \
