@@ -12,6 +12,7 @@ on:
       - "docker/**"
       - "tools/flux-gen"
       - ".github/workflows/docker.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
