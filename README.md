@@ -1,5 +1,26 @@
 # spark-llm-stack
 
+## Docker / container setup
+
+The `Dockerfile`, `run.sh`, and `docker-llm-switch` in this repo were derived from two sources:
+
+### From this repo (spark-llm-stack)
+
+- **CUDA environment variables** — `CUDA_SCALE_LAUNCH_QUEUES=4x`, `GGML_CUDA_GRAPH_OPT=1`, `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1` baked into the runtime image as `ENV` so every container inherits them without per-slot repetition.
+- **llama.cpp build flags** — the exact GB10-specific CMake flags from the [Build section](#build-llamacpp-gb10-specific-flags): `121a-real` native SASS, `GGML_CPU_KLEIDIAI` SVE2 GEMM, `GGML_CUDA_FA_ALL_QUANTS`, `GGML_CUDA_FORCE_MMQ`.
+- **Per-slot CMD arrays** in `docker-llm-switch` — each slot's `docker run` CMD is a verbatim copy of the corresponding `ExecStart` in the `.service` files, with `--host 0.0.0.0` substituted for `127.0.0.1` so Tailscale traffic on `tailscale0` reaches the server.
+- **POSTMORTEM hardening table** — `MemoryMax` and `MemoryHigh` values from the [Drop-ins table](#drop-ins-applied-by-harden-llm-stacksh) become `--memory` and `--memory-reservation` flags. `OOMPolicy=stop` maps to `--rm` for runtime containers and `--restart on-failure:3` for boot-default (deliberately not `unless-stopped`, which would recreate the OOM brick loop). `Conflicts=` mutual exclusion becomes `stop_all_except` before any slot start.
+- **`flux-gen`** — bundled into the container image (`COPY` into `/usr/local/bin`) and parameterized with `${FLUX_HOST:-http://127.0.0.1:8160}` so it can target a remote FLUX server over Tailscale.
+
+### From [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)
+
+- **Base image** — `nvidia/cuda:13.2.0-devel-ubuntu24.04`. That repo confirmed this is the right CUDA image for GB10 on aarch64 (later than the README's stated minimum of 13.0).
+- **Multi-stage builder → runtime pattern** — separate `builder` and `runtime` stages so the final image carries only `llama-server`, `llama-bench`, and their runtime libs, not the full CUDA dev toolchain and build tree.
+- **`ARG BUILD_JOBS=16`** — overridable build parallelism, matching the `MAX_JOBS` pattern used in that Dockerfile.
+- **No Tailscale in the container** — that repo uses direct host networking for cluster comms rather than VPN; the same principle applies here. Tailscale is already on the DGX Spark host, so `--network=host` is sufficient — no in-container `tailscaled` needed.
+
+---
+
 Local LLM inference stack for **NVIDIA DGX Spark (GB10 Grace Blackwell)**.  
 Two-service design: fast coder + deep reasoning architect, on-demand switching.  
 Benchmarked and tuned May 2026. All performance numbers are real.
