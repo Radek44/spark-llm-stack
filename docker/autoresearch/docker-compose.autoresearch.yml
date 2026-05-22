@@ -6,14 +6,27 @@ x-common: &common
     dockerfile: docker/autoresearch/Dockerfile.base
   image: spark-autoresearch-base:latest
   network_mode: host
+  ipc: host          # required for PyTorch multi-process DataLoader on UMA
   gpus: all
   restart: "no"
   stdin_open: true
   tty: true
+  # UMA-correct ulimits (cgroup hard caps don't work on DGX Spark unified memory;
+  # these prevent CUDA driver failures caused by memlock limits and deep stack overflows).
+  ulimits:
+    memlock: -1
+    stack: 67108864  # 64 MB
   environment:
     - UPSTREAM_ROOT=/workspace/upstreams
     - RUNS_ROOT=/workspace/runs
     - WORK_ROOT=/workspace/work
+    # Prevent PyTorch from speculatively reserving a large CUDA memory pool.
+    # On unified memory this pool competes directly with model weights.
+    - PYTORCH_NO_CUDA_MEMORY_CACHING=1
+    # Force UMA-aware managed-memory allocation path in the CUDA driver.
+    - CUDA_MANAGED_FORCE_DEVICE_ALLOC=1
+    # GB10 has 20 ARM cores (10×Cortex-X925 + 10×Cortex-A725); cap OMP threads.
+    - OMP_NUM_THREADS=20
   volumes:
     - ${UPSTREAMS_DIR:-./upstreams}:/workspace/upstreams
     - ${RUNS_DIR:-./runs}:/workspace/runs

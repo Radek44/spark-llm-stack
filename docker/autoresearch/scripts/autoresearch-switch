@@ -40,6 +40,12 @@ cmd_start() {
 
   echo "→ starting '$svc' (mutually exclusive mode)"
   stop_all_except "$svc"
+  # Flush Linux page/dentry/inode cache before launch.
+  # On DGX Spark unified memory the buffer cache can hold 8–20 GB after
+  # prior workloads; without this flush the effective working headroom is
+  # smaller than `free -h` suggests.
+  echo "→ flushing buffer cache (reclaims 8–20 GB of DGX Spark unified memory)"
+  sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
   compose up -d --build "$svc"
   cmd_status
 }

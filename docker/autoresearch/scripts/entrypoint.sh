@@ -61,8 +61,65 @@ setup_uv() {
   fi
 }
 
+# Apply the two GB10-specific patches to karpathy/autoresearch.
+# The dgx profile (David-Barnes fork) ships these fixes already; skip for it.
+#
+# Patch 1 — Flash Attention 3 removal
+#   FA3 (Dao-AILab/flash-attention) has no sm_121 aarch64 wheel and fails to
+#   build from source ("kernel built for sm80–sm100, running on sm121").
+#   Remove it from pyproject.toml so `uv sync` doesn't attempt the build.
+#   llama.cpp SDPA (scaled_dot_product_attention) is the correct replacement.
+#
+# Patch 2 — FLOPS constant: H100 990 → GB10 213
+#   The karpathy autoresearch agent uses this constant for time-budget
+#   reasoning inside the training loop. The upstream value (990 TFLOPS) is
+#   H100 BF16 peak; the GB10 measured value is 213 TFLOPS. Using the wrong
+#   value causes the agent to size models and set step counts for a ~5×
+#   faster GPU, leading to suboptimal experiments on GB10.
+#   Community-measured optimum: depth=3, dim=384, batch=2^16, ~6 GB VRAM.
+#
+# References:
+#   https://github.com/Dao-AILab/flash-attention/issues/1969
+#   https://forums.developer.nvidia.com/t/karpathys-autoresearch-customised-for-spark/362949
+#   https://rundatarun.io/p/the-overnight-loop
+patch_karpathy_for_gb10() {
+  local dir="$1"
+
+  # Patch 1: remove flash-attn from pyproject.toml
+  local pyproject="$dir/pyproject.toml"
+  if [ -f "$pyproject" ] && grep -qiE 'flash.?attn|flash.?attention' "$pyproject"; then
+    log "GB10 patch: removing flash-attn from pyproject.toml (no sm_121 support)"
+    sed -i '/flash.attn\|flash.attention/Id' "$pyproject"
+  else
+    log "GB10 patch: flash-attn not in pyproject.toml (already clean)"
+  fi
+
+  # Patch 2: replace FLOPS constant in train.py
+  local trainpy="$dir/train.py"
+  if [ ! -f "$trainpy" ]; then
+    log "GB10 patch: train.py not found, skipping FLOPS patch"
+    return 0
+  fi
+
+  # Try the scientific-notation form first (990e12), then the bare integer.
+  if grep -q '990e12' "$trainpy"; then
+    log "GB10 patch: train.py FLOPS 990e12 → 213e12 (H100 → GB10)"
+    sed -i 's/990e12/213e12/g' "$trainpy"
+  elif grep -qw '990' "$trainpy"; then
+    log "GB10 patch: train.py FLOPS 990 → 213 (H100 → GB10)"
+    sed -i 's/\b990\b/213/g' "$trainpy"
+  else
+    log "GB10 patch: FLOPS constant not found in train.py (already patched or upstream changed)"
+  fi
+}
+
 run_karpathy_like() {
   local dir="$1"
+  # karpathy/autoresearch targets H100; apply GB10 patches before uv sync.
+  # The dgx fork (David-Barnes) ships these fixes already.
+  if [ "$PROFILE" = "karpathy" ]; then
+    patch_karpathy_for_gb10 "$dir"
+  fi
   setup_uv "$dir"
   if [ -f "$dir/prepare.py" ]; then
     log "running prepare.py"
