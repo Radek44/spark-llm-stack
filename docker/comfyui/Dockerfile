@@ -10,11 +10,17 @@
 # Blackwell aarch64 notes (consensus across DGX Spark community work):
 # - TORCH_CUDA_ARCH_LIST=12.1a targets sm_121a SASS specifically.
 # - SageAttention is the only working fast-attention kernel on GB10
-#   (FlashAttention 2/3 has no sm_121 aarch64 wheels).
+#   (FlashAttention 2/3 has no sm_121 aarch64 wheels). Pinned to v2.2.0
+#   because v3 has confirmed mosaic artifacts on GB10 (thu-ml/SageAttention#321).
 # - torch.compile emits broken SASS for sm_121a → TORCH_COMPILE_DISABLE=1.
-# - --disable-pinned-memory + --reserve-vram 2.0 cooperate with Grace's
-#   unified-memory fabric (avoids the ComfyUI VAE Decode RAM spike
-#   reported in Comfy-Org/ComfyUI#11106).
+# - PYTORCH_NO_CUDA_MEMORY_CACHING=1 lets Grace's UMA fabric reclaim freed
+#   pages cleanly — without it, PyTorch's caching allocator hoards pages.
+# - comfy-aimdo installed for NVIDIA DynamicVRAM allocator (ComfyUI auto-
+#   detects and enables async weight offload when importable).
+# - --disable-pinned-memory mitigates the ComfyUI VAE Decode RAM spike
+#   (Comfy-Org/ComfyUI#11106); --reserve-vram 8.0 is community-validated
+#   headroom for heavy FLUX/LTX workflows (Triplany/comfyui-dgx-spark).
+# See docs/architecture/DECISIONS.md for the rationale on each choice.
 
 ARG CUDA_VERSION=13.2.0
 ARG UBUNTU_VERSION=24.04
@@ -25,7 +31,8 @@ FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI
 ARG COMFYUI_REF=master
 ARG SAGE_REPO=https://github.com/thu-ml/SageAttention
-ARG SAGE_REF=main
+# v2.2.0 — v3 has reported mosaic artifacts on GB10 (thu-ml/SageAttention#321).
+ARG SAGE_REF=v2.2.0
 ARG TORCH_VERSION=2.9.1
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 
@@ -63,6 +70,11 @@ RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} ComfyUI
 WORKDIR /build/ComfyUI
 RUN pip install -r requirements.txt
 
+# NVIDIA-backed DynamicVRAM allocator (aarch64 wheels on PyPI since 0.3.0).
+# ComfyUI auto-detects it; enables async weight offload + prevents memory
+# creep across workflow switches on unified memory.
+RUN pip install 'comfy-aimdo>=0.3.0'
+
 # SageAttention with sm_121a SASS. FlashAttention 2/3 has no working
 # aarch64 wheel for SM 12.1; SageAttention v3 is the consensus alternative.
 WORKDIR /build
@@ -82,6 +94,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_COMPILE_DISABLE=1 \
     CUDA_MANAGED_FORCE_DEVICE_ALLOC=1 \
     PYTORCH_ALLOC_CONF=expandable_segments:True \
+    PYTORCH_NO_CUDA_MEMORY_CACHING=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -120,5 +133,5 @@ CMD [ \
   "--listen", "0.0.0.0", \
   "--port", "8188", \
   "--disable-pinned-memory", \
-  "--reserve-vram", "2.0" \
+  "--reserve-vram", "8.0" \
 ]

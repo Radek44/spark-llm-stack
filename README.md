@@ -167,11 +167,19 @@ A slot lives in four files that must stay in sync. Change one, change all:
   the same `--network=host` + bind-mounted-models pattern as the llama
   slots. ComfyUI additionally bind-mounts `~/comfyui/{custom_nodes,output,user}`
   so anything you install via the Manager web UI persists across rebuilds.
+- **GPU clock-lock on every boot**: GB10 firmware does not persist
+  clock/power settings; a power-spike during heavy work can hard-crash
+  the host. Run the `nvidia-smi -lgc / boost-slider / -pm` sequence
+  from [`docker/SMOKE-TESTS.md`](docker/SMOKE-TESTS.md) §0 before
+  exercising any slot.
 - **ComfyUI OOM warning**: ComfyUI on Blackwell unified memory has a
   known issue (Comfy-Org/ComfyUI#11106) where chaining VAE Decode with
-  Depth nodes can spike past 128 GB in seconds. The image already passes
-  `--disable-pinned-memory` and `--reserve-vram 2.0` to mitigate; if you
-  still hit it, batch in smaller tiles and avoid forcing `--gpu-only`.
+  Depth nodes can spike past 128 GB in seconds. The image passes
+  `--disable-pinned-memory` (the actual spike fix), `--reserve-vram 8.0`
+  (community-validated headroom; was 2.0 before docs/architecture/DECISIONS.md §"ComfyUI reserve-vram"),
+  pins SageAttention to v2.2.0 (v3 has mosaic artifacts on GB10), and
+  installs `comfy-aimdo` for the NVIDIA DynamicVRAM allocator. If you
+  still hit OOM, batch in smaller tiles and avoid forcing `--gpu-only`.
 
 ### Commands
 

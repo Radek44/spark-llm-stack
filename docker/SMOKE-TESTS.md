@@ -8,6 +8,28 @@ to anything under `docker/` are considered shippable.
 
 Run from the repo root unless stated otherwise.
 
+## 0. Before you begin — host GPU setup (mandatory on a fresh boot)
+
+GB10 firmware does **not** persist GPU clock or power settings across
+reboots, and a power-spike during a long workflow (LTX, FLUX, heavy
+prefill) can hard-crash the host. Re-apply on every boot before
+exercising any slot:
+
+```bash
+sudo nvidia-smi -lgc 3003,3003           # lock SM clocks to max (prevents throttling + spikes)
+sudo nvidia-smi boost-slider --vboost 1  # core-clock boost for compute workloads
+sudo nvidia-smi -pm 1                    # persistence mode (reduces driver load latency)
+
+# Verify
+nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,persistence_mode --format=csv
+```
+
+Expected: current SM clock equals max SM clock, persistence mode `Enabled`.
+
+Source: NVIDIA Developer forum thread "Unlocking the Power of the Spark
+In ComfyUI (No Crashes)", confirmed by SparkyUI and Triplany kits. See
+`docs/architecture/DECISIONS.md` §"GPU clock-lock as an ops step".
+
 ## 1. Static checks (mandatory; no hardware needed)
 
 ```bash
@@ -83,6 +105,12 @@ curl -sf http://127.0.0.1:8160/sdcpp/v1/capabilities >/dev/null && echo OK
 docker-llm-switch comfyui
 # ComfyUI cold-start can run 60-120s; wait_ready handles this but verify:
 curl -sf http://127.0.0.1:8188/system_stats >/dev/null && echo OK
+
+# Verify comfy-aimdo (DynamicVRAM) and SageAttention v2.2 picked up:
+docker logs spark-llm-comfyui 2>&1 | grep -E 'aimdo|DynamicVRAM|SageAttention'
+# Expected lines:
+#   aimdo: comfy-aimdo inited for GPU: NVIDIA GB10 (VRAM: ~124546 MB)
+#   DynamicVRAM support detected and enabled
 ```
 
 From a Tailscale peer:

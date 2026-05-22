@@ -1,5 +1,11 @@
 # Hermes provider config for spark-llm-stack
 # Add these providers to ~/.hermes/config.yaml
+#
+# If you change `api:` to a non-loopback URL (e.g. a Tailscale IP), also
+# set `provider: custom` explicitly on the entry. The `vllm` provider alias
+# silently falls back to OpenRouter for non-localhost URLs, which will
+# look like Hermes is working but route every request off-host.
+# See docs/architecture/DECISIONS.md §"Hermes provider alias".
 
 providers:
   local-coder-mtp:
