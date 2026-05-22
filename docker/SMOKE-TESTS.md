@@ -152,6 +152,24 @@ docker ps --format '{{.Names}}'    # spark-llm-architect should be back
 Expected: `architect` auto-starts after daemon restart. (This is the
 codex P1 fix from commit 4830f2c.)
 
+## 9b. Boot-default survives `off` → `<slot>` cycle
+
+```bash
+docker-llm-switch boot-default architect
+docker-llm-switch boot-status        # expected: architect enabled
+docker-llm-switch off
+docker-llm-switch architect          # must docker-start in place, not recreate with --rm
+docker inspect spark-llm-architect --format \
+  '{{.HostConfig.RestartPolicy.Name}} {{.HostConfig.AutoRemove}}'
+# expected: unless-stopped false
+docker-llm-switch boot-status        # expected: architect still enabled
+```
+
+Expected: stopping and re-starting a boot-default slot preserves the
+`--restart unless-stopped` policy. Regression of this guard means the
+codex P2 fix in `run_slot` is broken — `boot-status` would lose the slot
+after the first `off` → start cycle.
+
 ## When to re-run
 
 - Every PR that touches `docker/**`, `tools/flux-gen`, or any `.service`

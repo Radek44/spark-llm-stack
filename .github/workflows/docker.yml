@@ -20,8 +20,15 @@ permissions:
 
 jobs:
   lint:
-    name: Dockerfile check
+    name: Dockerfile check (${{ matrix.dockerfile }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile:
+          - docker/Dockerfile
+          - docker/sd-server/Dockerfile
+          - docker/comfyui/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -35,26 +42,34 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: docker/Dockerfile
+          file: ${{ matrix.dockerfile }}
           push: false
           call: check
 
   scout:
-    name: Scout base-image scan
+    name: Scout base-image scan (${{ matrix.dockerfile }})
     runs-on: ubuntu-latest
     # Scan only on PRs and main pushes; skip on forks (no token).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile:
+          - docker/Dockerfile
+          - docker/sd-server/Dockerfile
+          - docker/comfyui/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
       # Scout can scan an image reference directly — no need to build the
-      # GB10-specific runtime image. We point it at the runtime base used
-      # in docker/Dockerfile (only thing in the final image we didn't write).
+      # GB10-specific runtime image. All three Dockerfiles expose
+      # ARG CUDA_VERSION / ARG UBUNTU_VERSION and FROM nvidia/cuda:...; the
+      # final-stage runtime base is what we want to scan for CVEs.
       - name: Resolve base image from Dockerfile
         id: base
         run: |
-          cuda=$(awk -F= '/^ARG CUDA_VERSION=/{print $2}' docker/Dockerfile)
-          ubuntu=$(awk -F= '/^ARG UBUNTU_VERSION=/{print $2}' docker/Dockerfile)
+          cuda=$(awk -F= '/^ARG CUDA_VERSION=/{print $2}' "${{ matrix.dockerfile }}")
+          ubuntu=$(awk -F= '/^ARG UBUNTU_VERSION=/{print $2}' "${{ matrix.dockerfile }}")
           echo "image=nvidia/cuda:${cuda}-runtime-ubuntu${ubuntu}" >> "$GITHUB_OUTPUT"
 
       - name: Docker Scout — CVEs (high/critical)
