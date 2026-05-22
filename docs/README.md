@@ -1,5 +1,9 @@
 # Docs Index
 
+## Architecture
+
+- [Decisions](./architecture/DECISIONS.md) — why each non-obvious choice in the stack
+
 ## Research
 
 - [Research Index](./research/README.md)
