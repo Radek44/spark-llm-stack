@@ -56,7 +56,7 @@ What are the optimal configurations, quantization strategies, parameter tunings,
 ## Expected Outputs
 
 Each subagent will save findings to:
-- `research_config_expansion/findings_[subtopic].md`
+- `docs/research/config_expansion/findings_[subtopic].md`
 
 Containing:
 - Key findings and parameters

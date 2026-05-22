@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+COMPOSE_FILE="$ROOT_DIR/docker/autoresearch/docker-compose.autoresearch.yml"
+ENV_FILE="$ROOT_DIR/.env.autoresearch"
+
+SERVICES=(karpathy dgx nauto-orch nauto-worker gemini autokernel)
+
+compose() {
+  if [ -f "$ENV_FILE" ]; then
+    docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+  else
+    docker compose -f "$COMPOSE_FILE" "$@"
+  fi
+}
+
+is_valid_service() {
+  local svc="$1"
+  for s in "${SERVICES[@]}"; do
+    [ "$s" = "$svc" ] && return 0
+  done
+  return 1
+}
+
+stop_all_except() {
+  local keep="$1"
+  for svc in "${SERVICES[@]}"; do
+    [ "$svc" = "$keep" ] && continue
+    compose rm -sf "$svc" >/dev/null 2>&1 || true
+  done
+}
+
+cmd_start() {
+  local svc="${1:-}"
+  if ! is_valid_service "$svc"; then
+    echo "usage: autoresearch-switch start <${SERVICES[*]}>" >&2
+    exit 1
+  fi
+
+  echo "→ starting '$svc' (mutually exclusive mode)"
+  stop_all_except "$svc"
+  compose up -d --build "$svc"
+  cmd_status
+}
+
+cmd_off() {
+  echo "→ stopping all autoresearch profiles"
+  compose down --remove-orphans
+}
+
+cmd_status() {
+  compose ps
+}
+
+cmd_logs() {
+  local svc="${1:-}"
+  if ! is_valid_service "$svc"; then
+    echo "usage: autoresearch-switch logs <${SERVICES[*]}>" >&2
+    exit 1
+  fi
+  compose logs -f --tail=200 "$svc"
+}
+
+cmd_bootstrap() {
+  echo "→ creating local runtime directories"
+  mkdir -p "$ROOT_DIR/upstreams" "$ROOT_DIR/runs" "$ROOT_DIR/work" "$ROOT_DIR/secrets"
+  echo "done: upstreams/ runs/ work/ secrets/"
+}
+
+case "${1:-status}" in
+  start)
+    cmd_start "${2:-}"
+    ;;
+  off)
+    cmd_off
+    ;;
+  status)
+    cmd_status
+    ;;
+  logs)
+    cmd_logs "${2:-}"
+    ;;
+  bootstrap)
+    cmd_bootstrap
+    ;;
+  help|-h|--help)
+    cat <<USAGE
+autoresearch-switch
+
+Commands:
+  autoresearch-switch bootstrap
+  autoresearch-switch start <karpathy|dgx|nauto-orch|nauto-worker|gemini|autokernel>
+  autoresearch-switch off
+  autoresearch-switch status
+  autoresearch-switch logs <karpathy|dgx|nauto-orch|nauto-worker|gemini|autokernel>
+USAGE
+    ;;
+  *)
+    echo "unknown command: ${1:-}" >&2
+    exit 1
+    ;;
+esac

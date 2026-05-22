@@ -151,7 +151,7 @@ Before applying changes, test on actual GB10 host:
 
 ### Directory Structure
 ```
-research_config_expansion/
+docs/research/config_expansion/
 ├── research_plan.md
 ├── RESEARCH_SUMMARY.md (this file)
 ├── findings_llama_cpp.md

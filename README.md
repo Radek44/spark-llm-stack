@@ -41,6 +41,12 @@ spark-llm-stack/
 │   │                              --restart unless-stopped → boot-default,
 │   │                              IMAGE[<slot>] picks llama / sd-server / comfyui)
 │   └── run.sh                    thin wrapper: delegates to docker-llm-switch
+│   └── autoresearch/             launcher path: upstream autoresearch repos in isolated containers
+│      ├── README.md                quickstart + profile graph + source attribution
+│      ├── docker-compose.autoresearch.yml
+│      ├── Dockerfile.base
+│      ├── scripts/autoresearch-switch
+│      └── SMOKE-TESTS.md
 │
 ├── tools/
 │   └── flux-gen                 CLI for the FLUX.2-klein async image API
@@ -54,6 +60,19 @@ spark-llm-stack/
     └── drop-ins/                snapshot of what harden-llm-stack.sh writes
                                  to ~/.config/systemd/user/<unit>.d/override.conf
                                  (live files — this is just a reference copy)
+```
+
+## Autoresearch launcher
+
+For upstream autoresearch-style projects (without code folding), use:
+
+- [docker/autoresearch/README.md](docker/autoresearch/README.md)
+- [docker/autoresearch/SMOKE-TESTS.md](docker/autoresearch/SMOKE-TESTS.md)
+
+Core command:
+
+```bash
+./docker/autoresearch/scripts/autoresearch-switch start karpathy
 ```
 
 ## How everything wires together
