@@ -677,7 +677,7 @@ slot** (manual edit — every block contains the same `-c 131072` /
 # 1a. Edit the systemd unit (single value, sed-safe).
 sed -i 's/-c 131072/-c 262144/' systemd/units/qwen27-mtp.service
 # 1b. Hand-edit docker/docker-llm-switch: inside the CMD_coder=(...) block,
-#     change "-ngl 999 -fa on -c 131072" to "-c 262144".
+#     change the "-c 131072" token to "-c 262144" (leave -ngl 999 -fa on intact).
 $EDITOR docker/docker-llm-switch
 
 # 2. Reload + restart.
