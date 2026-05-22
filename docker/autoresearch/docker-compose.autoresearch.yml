@@ -1,0 +1,99 @@
+name: autoresearch
+
+x-common: &common
+  build:
+    context: ../..
+    dockerfile: docker/autoresearch/Dockerfile.base
+  image: spark-autoresearch-base:latest
+  network_mode: host
+  ipc: host          # required for PyTorch multi-process DataLoader on UMA
+  gpus: all
+  restart: "no"
+  stdin_open: true
+  tty: true
+  # Cross-stack failsafe enumeration labels. spark-panic and the admission
+  # gate (docker/lib/spark-mem.sh) filter on `spark.exclusive=true` to find
+  # all heavyweight containers across BOTH stacks (spark-llm-* and
+  # spark-autoresearch-*). Do not change without updating spark-mem.sh.
+  labels:
+    spark.exclusive: "true"
+    spark.stack: "autoresearch"
+  # UMA-correct ulimits (cgroup hard caps don't work on DGX Spark unified memory;
+  # these prevent CUDA driver failures caused by memlock limits and deep stack overflows).
+  ulimits:
+    memlock: -1
+    stack: 67108864  # 64 MB
+  environment:
+    - UPSTREAM_ROOT=/workspace/upstreams
+    - RUNS_ROOT=/workspace/runs
+    - WORK_ROOT=/workspace/work
+    # Prevent PyTorch from speculatively reserving a large CUDA memory pool.
+    # On unified memory this pool competes directly with model weights.
+    - PYTORCH_NO_CUDA_MEMORY_CACHING=1
+    # Force UMA-aware managed-memory allocation path in the CUDA driver.
+    - CUDA_MANAGED_FORCE_DEVICE_ALLOC=1
+    # GB10 has 20 ARM cores (10×Cortex-X925 + 10×Cortex-A725); cap OMP threads.
+    - OMP_NUM_THREADS=20
+  volumes:
+    - ${UPSTREAMS_DIR:-./upstreams}:/workspace/upstreams
+    - ${RUNS_DIR:-./runs}:/workspace/runs
+    - ${WORK_DIR:-./work}:/workspace/work
+    - ${SECRETS_DIR:-./secrets}:/secrets:ro
+
+services:
+  karpathy:
+    <<: *common
+    container_name: spark-autoresearch-karpathy
+    environment:
+      - AUTORESEARCH_PROFILE=karpathy
+      - TRAIN_TIMEOUT=${KARPATHY_TRAIN_TIMEOUT:-600}
+    mem_limit: ${KARPATHY_MEM_LIMIT:-60g}
+    mem_reservation: ${KARPATHY_MEM_RESERVATION:-45g}
+
+  dgx:
+    <<: *common
+    container_name: spark-autoresearch-dgx
+    environment:
+      - AUTORESEARCH_PROFILE=dgx
+      - TRAIN_TIMEOUT=${DGX_TRAIN_TIMEOUT:-600}
+    mem_limit: ${DGX_MEM_LIMIT:-80g}
+    mem_reservation: ${DGX_MEM_RESERVATION:-60g}
+
+  nauto-orch:
+    <<: *common
+    container_name: spark-autoresearch-nauto-orch
+    environment:
+      - AUTORESEARCH_PROFILE=nauto-orch
+      - NAUTO_ROLE=orchestrator
+    mem_limit: ${NAUTO_ORCH_MEM_LIMIT:-40g}
+    mem_reservation: ${NAUTO_ORCH_MEM_RESERVATION:-30g}
+
+  nauto-worker:
+    <<: *common
+    container_name: spark-autoresearch-nauto-worker
+    environment:
+      - AUTORESEARCH_PROFILE=nauto-worker
+      - NAUTO_ROLE=worker
+    mem_limit: ${NAUTO_WORKER_MEM_LIMIT:-80g}
+    mem_reservation: ${NAUTO_WORKER_MEM_RESERVATION:-60g}
+
+  gemini:
+    <<: *common
+    container_name: spark-autoresearch-gemini
+    environment:
+      - AUTORESEARCH_PROFILE=gemini
+    mem_limit: ${GEMINI_MEM_LIMIT:-8g}
+    mem_reservation: ${GEMINI_MEM_RESERVATION:-4g}
+
+  autokernel:
+    <<: *common
+    container_name: spark-autoresearch-autokernel
+    environment:
+      - AUTORESEARCH_PROFILE=autokernel
+      - AUTOKERNEL_STAGE=${AUTOKERNEL_STAGE:-profile}
+      - AUTOKERNEL_PROFILE_ARGS=${AUTOKERNEL_PROFILE_ARGS:-}
+      - AUTOKERNEL_EXTRACT_ARGS=${AUTOKERNEL_EXTRACT_ARGS:-}
+      - AUTOKERNEL_BENCH_ARGS=${AUTOKERNEL_BENCH_ARGS:-}
+      - AUTOKERNEL_VERIFY_ARGS=${AUTOKERNEL_VERIFY_ARGS:-}
+    mem_limit: ${AUTOKERNEL_MEM_LIMIT:-70g}
+    mem_reservation: ${AUTOKERNEL_MEM_RESERVATION:-50g}

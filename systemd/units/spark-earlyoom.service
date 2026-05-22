@@ -1,0 +1,73 @@
+# spark-earlyoom.service — runtime memory failsafe for DGX Spark (GB10).
+#
+# Layer 2 of the cross-stack failsafe (see docker/lib/spark-mem.sh and
+# tools/spark-panic for Layers 1 and 3, and
+# docs/research/autoresearch/findings_failsafe_design.md for the full design).
+#
+# Why earlyoom and not systemd-oomd?
+#   - NVIDIA explicitly recommends earlyoom for DGX Spark in
+#     https://forums.developer.nvidia.com/t/358951 ("Spark hangs - requires a
+#     hard-reset"): "on GB10, CPU and GPU share the same physical memory pool,
+#     so an OOM event can starve the kernel itself before the OOM killer gets
+#     a chance to act."
+#   - earlyoom is ~2 MiB RSS, mlock'd, polls /proc/meminfo cheaply, and
+#     supports a -N preempt hook that runs BEFORE SIGKILL (we wire this to
+#     spark-panic so containers are stopped gracefully instead of leaving
+#     a half-killed kernel-space CUDA context).
+#   - systemd-oomd is great on cgroup leaves but needs all Docker containers
+#     placed in a managed slice, which requires reworking dockerd. earlyoom
+#     works regardless of cgroup membership — exactly what we need on UMA.
+#
+# Install:
+#   sudo apt-get install earlyoom
+#   sudo cp tools/spark-panic /usr/local/bin/spark-panic
+#   sudo cp docker/lib/spark-mem.sh /usr/local/lib/spark-mem.sh
+#   sudo cp systemd/units/spark-earlyoom.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now spark-earlyoom.service
+#
+# Verify:
+#   systemctl status spark-earlyoom
+#   journalctl -u spark-earlyoom -f
+#
+# Flag reference (see `earlyoom --help`):
+#   -m PERCENT[,KILL_PERCENT]   memory thresholds (% of MemTotal MemAvailable)
+#   -s PERCENT[,KILL_PERCENT]   swap thresholds (DGX Spark default has none)
+#   -r SECONDS                  report interval to stderr/journal
+#   -N /path/to/script          run script before SIGKILL (preempt hook)
+#   --avoid REGEX               never kill processes matching REGEX
+#   --prefer REGEX              prefer to kill processes matching REGEX
+
+[Unit]
+Description=earlyoom watchdog for DGX Spark cross-stack memory failsafe
+Documentation=https://github.com/rfjakob/earlyoom
+Documentation=https://forums.developer.nvidia.com/t/358951
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+# Threshold rationale on a 128 GiB UMA host:
+#   -m 8,4   ≈ SIGTERM when MemAvailable < ~10 GiB; SIGKILL when < ~5 GiB.
+#            Earlier than the kernel OOM killer (which kicks ~0 free) so the
+#            host stays responsive over SSH for recovery.
+#   -s 90,80 swap is typically disabled on DGX Spark; the flag is harmless.
+#   -r 60    one report per minute to keep journal noise low.
+# --avoid keeps init/sshd/docker daemons safe so we never get locked out.
+# --prefer biases earlyoom toward the heavy workload processes.
+ExecStart=/usr/bin/earlyoom \
+  --avoid '(^|/)(systemd|systemd-journald|systemd-logind|sshd|dockerd|containerd|earlyoom|init)$' \
+  --prefer '(^|/)(llama-server|python|python3|comfy|node|sd-server|stable-diffusion|uv|cargo)$' \
+  -m 8,4 \
+  -s 90,80 \
+  -r 60 \
+  -N /usr/local/bin/spark-panic
+Restart=on-failure
+RestartSec=5
+# earlyoom must keep running even when the system is under heavy memory
+# pressure; it self-mlocks so this is mostly about scheduling priority.
+Nice=-10
+OOMScoreAdjust=-1000
+
+[Install]
+WantedBy=multi-user.target

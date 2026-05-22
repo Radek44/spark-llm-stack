@@ -4,10 +4,11 @@ This file captures the non-obvious choices in `spark-llm-stack`. Each
 entry says *what* and *why*, citing the evidence. Skip the prose at the
 file you're reading; come here when a flag or pattern is non-obvious.
 
-The companion research workspace on the `cr1` branch under `docs/research/`
-holds the source material for many of these decisions (RESEARCH.md,
-CONFIG_GUIDE.md, the `config_expansion/` and `llamacpp_tuning/` workspaces).
-Where this file cites those documents, it means "on `cr1`".
+The companion research workspace under `docs/research/` holds the source
+material for many of these decisions (RESEARCH.md, CONFIG_GUIDE.md, the
+`config_expansion/`, `llamacpp_tuning/`, and `autoresearch/` workspaces).
+The cross-stack memory failsafe design lives at
+`docs/research/autoresearch/findings_failsafe_design.md`.
 
 ---
 
@@ -69,7 +70,7 @@ a long-running server.
 Both pin model weights into anonymous, non-evictable pages. On 128 GB
 unified memory this starves co-resident services and removes the kernel's
 ability to free pages under pressure. CLAUDE.md flags these as never to
-appear in service files. The research surveyed on `cr1` did not propose
+appear in service files. The research surveyed in `docs/research/` did not propose
 adding them; this decision is unchanged.
 
 ## 6. ComfyUI: `SAGE_REF=v2.2.0` pin
@@ -88,7 +89,7 @@ allocator fights the UMA fabric. Setting the env var lets the OS reclaim
 freed pages cleanly. Compatible with the existing
 `PYTORCH_ALLOC_CONF=expandable_segments:True` — they address different
 allocator behaviors and run together. Source: SparkyUI and Triplany
-projects both set this; CONFIG_GUIDE.md §4 on `cr1`.
+projects both set this; CONFIG_GUIDE.md §4 in `docs/research/`.
 
 ## 8. ComfyUI: `--reserve-vram 8.0` (was 2.0)
 
@@ -128,7 +129,7 @@ EAS / heterogeneous scheduling on Armv9 already prefers latency-sensitive
 work on X925.
 
 This change is unvalidated on hardware. `LLAMACPP_TUNING_PLAN.md` and
-`LLAMACPP_BASELINE_RESULTS.md` on `cr1` describe the benchmark
+`LLAMACPP_BASELINE_RESULTS.md` in `docs/research/` describe the benchmark
 methodology to validate it. Rollback is `git revert`.
 
 ## 11. Context window `-c 131072` (was `262144`) — and the now-available `--parallel 2`
@@ -165,21 +166,21 @@ correctly applied in any ComfyUI workflow batch settings.
 
 ## 13. Why we did NOT add vLLM as an 8th slot
 
-`CONFIG_GUIDE.md` §5 on `cr1` describes a vLLM container recipe for
+`CONFIG_GUIDE.md` §5 in `docs/research/` describes a vLLM container recipe for
 GB10. PagedAttention reduces KV fragmentation and AWQ quantization adds
 ~3.5× throughput on bandwidth-limited GB10. We deferred adoption because
 the current llama.cpp slots haven't hit a throughput ceiling that
 justifies a parallel inference stack — adding vLLM means another image,
 another slot, another set of mirrored configs, and a separate model
 roster (AWQ-quantized weights). Revisit if measured per-slot throughput
-on the new threading is still the bottleneck. The cr1 recipe is the
+on the new threading is still the bottleneck. The recipe in docs/research/ is the
 starting point.
 
 ## 14. Why we did NOT enable TurboQuant `turbo3` KV cache
 
 4.9× KV cache compression unlocks ~536K context on this hardware. But
 the research itself flags MTP-branch stability of `turbo3` as unclear
-(see `findings_turboquant.md` and `findings_llama_cpp.md` on `cr1`).
+(see `findings_turboquant.md` and `findings_llama_cpp.md` in `docs/research/`).
 At our current `-c 262144` with `q8_0/q8_0` we're not memory-pressured
 on the KV cache. Revisit if a use case actually needs >256K context, or
 the MTP+turbo3 combo gets community validation.
@@ -203,7 +204,7 @@ config with `provider: custom` does not. For loopback URLs (the default
 in `config/hermes-config-snippet.yaml`) it doesn't matter. As soon as a
 Tailscale IP or LAN host is involved, use `provider: custom` explicitly
 — otherwise Hermes will look like it's working while routing every
-request off-box. Source: CONFIG_GUIDE.md §5/§6 on `cr1`.
+request off-box. Source: CONFIG_GUIDE.md §5/§6 in `docs/research/`.
 
 ---
 
@@ -218,14 +219,17 @@ follow-ups that need user input or hardware access before they can move.
   Once nominated, change `docker/Dockerfile`'s `ARG LLAMA_REF=master`
   default to that SHA.
 - **Run `LLAMACPP_TUNING_PLAN.md` benchmark on hardware** (decision 10) —
-  validates the 16/24 threading change. Plan + result template live on
-  `cr1` under `docs/research/`. Needs `llama-bench` + concurrent `curl`
-  against `llama-server` on the Spark; no shortcut.
+  validates the 16/24 threading change. Plan + result template live at
+  `docs/research/LLAMACPP_TUNING_PLAN.md` /
+  `docs/research/LLAMACPP_BASELINE_RESULTS.md`. Needs `llama-bench` +
+  concurrent `curl` against `llama-server` on the Spark; no shortcut.
 - **Enable `--parallel 2` on a chosen slot** (decision 11) — now
   memory-safe at 128K context; un-gated by a product decision (do you
   want concurrent requests sharing a slot?).
 - **Adopt vLLM as an 8th slot** (decision 13) — only if measured
   throughput ceiling actually justifies it.
-- **Adopt `docker/autoresearch/` runtime** — lives on `cr1` and is being
-  actively edited there. Do not cherry-pick onto this branch until cr1
-  is settled.
+- **Install the cross-stack memory failsafe on the DGX host** — code is
+  in-tree (`docker/lib/spark-mem.sh`, `tools/spark-panic`,
+  `systemd/units/spark-earlyoom.service`). The host-side install steps
+  (apt-get earlyoom, copy lib + panic + unit, NOPASSWD sudoers line)
+  live in `README.md` § "Cross-stack memory failsafe".

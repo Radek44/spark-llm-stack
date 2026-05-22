@@ -75,6 +75,32 @@ RUN pip install -r requirements.txt
 # creep across workflow switches on unified memory.
 RUN pip install 'comfy-aimdo>=0.3.0'
 
+# Patch comfy/model_management.py for DGX Spark unified memory.
+#
+# Problem: cudaMemGetInfo() under-reports free memory on GB10 when another
+# CUDA process (e.g. llama-server) is resident — it may show ~6 GB free when
+# 40+ GB are actually available, causing ComfyUI to partially offload the text
+# encoder and slow inference ~2×.
+#
+# Fix: replace the CUDA call with psutil.virtual_memory().available, which
+# reads /proc/meminfo and returns the true host available RAM. On GB10 this is
+# the ground truth because system RAM = GPU memory (unified pool).
+RUN python3 -c "
+import pathlib, sys
+f = pathlib.Path('comfy/model_management.py')
+if not f.exists():
+    print('WARNING: comfy/model_management.py not found — skipping patch', file=sys.stderr)
+    sys.exit(0)
+old = 'mem_free_cuda, _ = torch.cuda.mem_get_info(dev)'
+new = 'import psutil as _psutil; mem_free_cuda = _psutil.virtual_memory().available'
+txt = f.read_text()
+if old not in txt:
+    print('WARNING: patch target not found (already patched or upstream changed)', file=sys.stderr)
+    sys.exit(0)
+f.write_text(txt.replace(old, new, 1))
+print('model_management.py patched: cudaMemGetInfo -> psutil.virtual_memory().available')
+"
+
 # SageAttention with sm_121a SASS. FlashAttention 2/3 has no working
 # aarch64 wheel for SM 12.1; SageAttention v3 is the consensus alternative.
 WORKDIR /build
