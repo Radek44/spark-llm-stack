@@ -59,6 +59,14 @@ jobs:
 
       - name: Docker Scout — CVEs (high/critical)
         uses: docker/scout-action@v1
+        env:
+          # Repo secrets must be exposed to the step env explicitly —
+          # docker/scout-action reads these from the environment, not
+          # from `with:` inputs. Without this block the action falls
+          # back to ambient GitHub credentials and fails with
+          # "user <actor> not entitled to use Docker Scout".
+          DOCKER_SCOUT_HUB_USER: ${{ secrets.DOCKER_SCOUT_HUB_USER }}
+          DOCKER_SCOUT_HUB_PASSWORD: ${{ secrets.DOCKER_SCOUT_HUB_PASSWORD }}
         with:
           command: cves
           image: ${{ steps.base.outputs.image }}
