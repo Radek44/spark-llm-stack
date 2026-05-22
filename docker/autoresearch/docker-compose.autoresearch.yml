@@ -11,6 +11,13 @@ x-common: &common
   restart: "no"
   stdin_open: true
   tty: true
+  # Cross-stack failsafe enumeration labels. spark-panic and the admission
+  # gate (docker/lib/spark-mem.sh) filter on `spark.exclusive=true` to find
+  # all heavyweight containers across BOTH stacks (spark-llm-* and
+  # spark-autoresearch-*). Do not change without updating spark-mem.sh.
+  labels:
+    spark.exclusive: "true"
+    spark.stack: "autoresearch"
   # UMA-correct ulimits (cgroup hard caps don't work on DGX Spark unified memory;
   # these prevent CUDA driver failures caused by memlock limits and deep stack overflows).
   ulimits:

@@ -33,10 +33,12 @@ Other profiles:
 ```
 
 ## Runtime Model
-- Mutually exclusive by default.
-- Starting one profile force-stops the others.
+- Intra-stack mutually exclusive: starting one profile force-stops other autoresearch profiles.
+- Cross-stack admission gate: every `autoresearch-switch start` and every `docker-llm-switch <slot>` now acquires a shared `flock` on `/var/run/spark-mem.lock`, checks `MemAvailable`, and force-stops the *other* stack if the new workload's projected cap would exceed the safe headroom.
+- All exclusive containers carry the Docker label `spark.exclusive=true` so `docker ps --filter "label=spark.exclusive=true"` shows the canonical cross-stack view.
+- Runtime watchdog: `systemd/units/spark-earlyoom.service` enforces a last-resort kill at MemAvailable < 8 % (SIGTERM) / < 4 % (SIGKILL); see `docs/research/autoresearch/findings_failsafe_design.md` for the full design and the NVIDIA-forum citations that motivate it.
 - Containers run with `--network=host` and `--gpus=all`.
-- Per-profile memory caps are configured in `.env.autoresearch`.
+- Per-profile memory caps are configured in `.env.autoresearch`. They are *planning budgets* — cgroup hard caps do not enforce on GB10 UMA. Real enforcement comes from the admission gate + earlyoom watchdog + `spark-panic`.
 
 ## Mounts
 - `upstreams/` -> `/workspace/upstreams`
@@ -52,4 +54,5 @@ The mount is read-only in containers.
 ```bash
 ./docker/autoresearch/scripts/autoresearch-switch logs karpathy
 ./docker/autoresearch/scripts/autoresearch-switch off
+./docker/autoresearch/scripts/autoresearch-switch panic   # cross-stack emergency stop
 ```

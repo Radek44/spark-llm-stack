@@ -75,6 +75,67 @@ Core command:
 ./docker/autoresearch/scripts/autoresearch-switch start karpathy
 ```
 
+## Cross-stack memory failsafe (REQUIRED on the DGX host)
+
+Docker `--memory` and cgroup `memory.max` do **not** enforce caps on CUDA
+allocations on GB10 — confirmed in NVIDIA forums [#264689][f264689],
+[#353752][f353752], and [#358951][f358951] (NVIDIA staff explicitly recommend
+earlyoom as the mitigation). The repo therefore ships a three-layer userspace
+failsafe that works regardless of cgroup behaviour:
+
+1. **Admission gate** — `docker/lib/spark-mem.sh`, sourced by both switches.
+   Acquires a shared `flock`, checks `MemAvailable`, and (if a new workload's
+   cap would exceed the headroom) force-stops cross-stack containers before
+   launch. Switches now stamp every exclusive container with
+   `label spark.exclusive=true` so the enumeration works across both stacks.
+2. **Runtime watchdog** — `systemd/units/spark-earlyoom.service`. earlyoom
+   polls `/proc/meminfo`, fires SIGTERM at MemAvailable < 8 % and SIGKILL at
+   < 4 %, and runs `/usr/local/bin/spark-panic` *before* SIGKILL via the
+   `-N` hook — so containers stop gracefully instead of leaving zombie CUDA
+   contexts.
+3. **Panic / recovery** — `tools/spark-panic`, also reachable as
+   `docker-llm-switch panic` and `autoresearch-switch panic`. Stops every
+   container with the exclusive label across both stacks, clears restart
+   policies, and drops the page cache.
+
+Install:
+
+```bash
+sudo apt-get install -y earlyoom
+sudo cp docker/lib/spark-mem.sh    /usr/local/lib/spark-mem.sh
+sudo cp tools/spark-panic          /usr/local/bin/spark-panic
+sudo chmod +x /usr/local/bin/spark-panic
+sudo cp systemd/units/spark-earlyoom.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now spark-earlyoom.service
+```
+
+`spark_drop_caches` uses `sudo -n` (non-interactive) so the admission gate
+never blocks on a password prompt under SSH-without-TTY or cron. Grant
+NOPASSWD for the single command by adding this line via `sudo visudo`:
+
+```
+<your-operator-user> ALL=(root) NOPASSWD: /bin/sh -c sync; echo 3 > /proc/sys/vm/drop_caches
+```
+
+Without it, the failsafe still works — `drop_caches` just becomes a no-op
+and the admission gate runs against unflushed memory (visible in
+`journalctl` as `drop_caches failed (sudo -n required; configure NOPASSWD)`).
+
+Verify:
+
+```bash
+systemctl status spark-earlyoom        # active (running)
+docker-llm-switch panic                # idempotent
+spark-panic                            # same, manual route
+```
+
+Full design and citations: [`docs/research/autoresearch/findings_failsafe_design.md`](docs/research/autoresearch/findings_failsafe_design.md).
+
+[f264689]: https://forums.developer.nvidia.com/t/cuda-unified-memory-usage-is-not-accounted-by-linux-cgroup/264689
+[f353752]: https://forums.developer.nvidia.com/t/dgx-spark-becomes-unresponsive-zombie-instead-of-throwing-cuda-oom/353752
+[f358951]: https://forums.developer.nvidia.com/t/spark-hangs-requires-a-hard-reset-physically-unplugging/358951
+
 ## How everything wires together
 
 ```

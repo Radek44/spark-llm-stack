@@ -29,6 +29,42 @@ WAIT_TIMEOUT=300
 
 SLOTS=(coder architect gemma vision gptoss imagine comfyui)
 
+# ── cross-stack failsafe library (docker/lib/spark-mem.sh) ────────────────────
+#
+# Provides: spark_acquire_lock, spark_admission_check,
+# spark_cross_stack_stop_others, spark_drop_caches, spark_panic_stop_all,
+# spark_parse_gb. See docker/lib/spark-mem.sh for rationale.
+_SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SPARK_MEM_LIB="${SPARK_MEM_LIB:-$_SCRIPT_DIR/lib/spark-mem.sh}"
+if [ ! -r "$SPARK_MEM_LIB" ]; then
+  # When installed to ~/.local/bin the lib is no longer adjacent — check the
+  # standard install locations.
+  for _cand in /usr/local/lib/spark-mem.sh /etc/spark-llm-stack/spark-mem.sh \
+               "$HOME/spark-llm-stack/docker/lib/spark-mem.sh"; do
+    [ -r "$_cand" ] && SPARK_MEM_LIB="$_cand" && break
+  done
+fi
+if [ -r "$SPARK_MEM_LIB" ]; then
+  # shellcheck source=lib/spark-mem.sh
+  . "$SPARK_MEM_LIB"
+else
+  echo "docker-llm-switch: warning — spark-mem.sh not found; failsafe shims active" >&2
+  spark_acquire_lock() { :; }
+  spark_admission_check() { return 0; }
+  spark_cross_stack_stop_others() { :; }
+  spark_drop_caches() { sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true; }
+  spark_panic_stop_all() {
+    echo "spark-panic shim: stopping every spark-* docker container" >&2
+    docker ps -q --filter "name=spark-" | xargs -r docker stop -t 10 >/dev/null 2>&1 || true
+  }
+  spark_parse_gb() {
+    local r="${1:-0}"
+    r=$(printf '%s' "$r" | tr '[:upper:]' '[:lower:]')
+    # %%g* greedy-strips everything from the first 'g' so "40gb" -> "40", not "40b".
+    case "$r" in *gb|*g) echo "${r%%g*}" ;; *) echo 0 ;; esac
+  }
+fi
+
 declare -A PORTS=(
   [coder]=8152 [architect]=8154 [gemma]=8156 [vision]=8155 [gptoss]=8157
   [imagine]=8160 [comfyui]=8188
@@ -296,6 +332,9 @@ docker_run_slot() {
     --oom-score-adj=200 \
     --ulimit memlock=-1:-1 \
     --shm-size=1g \
+    --label "spark.exclusive=true" \
+    --label "spark.stack=llm" \
+    --label "spark.slot=$slot" \
     "${extra_mounts[@]}" \
     -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}" \
     "$image" \
@@ -447,7 +486,29 @@ is_slot() {
 if is_slot "$CMD"; then
   target=$(ctr_name "$CMD")
   echo "→ $CMD mode (${ROLES[$CMD]})"
+
+  # Layer 1 of the cross-stack failsafe: shared mutex + admission gate.
+  spark_acquire_lock || exit 1
+
+  # Intra-stack: stop other spark-llm-* slots (existing behaviour).
   stop_all_except "$target"
+
+  # Flush BEFORE admission so the check sees post-flush MemAvailable —
+  # mirrors autoresearch-switch, keeps cross-stack eviction policy
+  # symmetric regardless of which switch initiated the start.
+  spark_drop_caches
+
+  # Cross-stack admission gate: if this slot's cap fits within available
+  # memory (minus 8 GiB headroom), allow coexistence with autoresearch
+  # containers; otherwise stop the cross-stack set first.
+  projected_gb=$(spark_parse_gb "${MEMCAP[$CMD]}")
+  if ! spark_admission_check "$projected_gb"; then
+    echo "  insufficient memory for $CMD (${projected_gb}GiB cap); stopping cross-stack containers"
+    spark_cross_stack_stop_others "$target"
+  else
+    echo "  admission ok: ${projected_gb}GiB fits without stopping cross-stack containers"
+  fi
+
   if [ "$(ctr_state "$target")" = "running" ]; then
     echo "  already running"
   else
@@ -484,6 +545,9 @@ case "$CMD" in
   boot-status)
     boot_status
     ;;
+  panic)
+    spark_panic_stop_all
+    ;;
   -h|--help|help)
     cat <<EOF
 docker-llm-switch — Docker-native llm-switch for DGX Spark GB10
@@ -498,6 +562,13 @@ Boot (Docker daemon restart policy):
   docker-llm-switch boot-default <slot>
                                     set ONE slot to --restart unless-stopped
   docker-llm-switch boot-status     show what auto-starts at Docker boot
+
+Cross-stack failsafe:
+  docker-llm-switch panic           emergency stop of EVERY container with
+                                    label spark.exclusive=true (BOTH stacks),
+                                    clears restart policies, drops page cache.
+                                    Same effect as autoresearch-switch panic
+                                    or /usr/local/bin/spark-panic.
 
 Slots: ${SLOTS[*]}
 
