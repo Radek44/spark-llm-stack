@@ -1,0 +1,8 @@
+.git
+.github
+reference-previous
+POSTMORTEM.md
+README.md
+CLAUDE.md
+*.md
+models

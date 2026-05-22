@@ -28,12 +28,18 @@ spark-llm-stack/
 │                                 contract POSTMORTEM mandates
 │
 ├── docker/                      MIRROR path: same slots, in containers
-│   ├── Dockerfile                multi-stage CUDA 13.2 + llama.cpp build
+│   ├── Dockerfile                llama.cpp image (coder/architect/gemma/vision/gptoss)
+│   ├── sd-server/Dockerfile      stable-diffusion.cpp image for imagine (FLUX.2-klein)
+│   ├── comfyui/
+│   │   ├── Dockerfile            ComfyUI image (PyTorch cu130 + SageAttention sm_121a)
+│   │   └── entrypoint.sh         seeds ComfyUI-Manager into the bind-mounted custom_nodes
+│   ├── docker-compose.yml        declarative build for all three images
 │   ├── docker-llm-switch         Docker analogue of systemd llm-switch
 │   │                             (stop_all_except → Conflicts=,
 │   │                              --rm → OOMPolicy=stop,
 │   │                              --oom-score-adj=200 → OOMScoreAdjust=200,
-│   │                              --restart unless-stopped → boot-default)
+│   │                              --restart unless-stopped → boot-default,
+│   │                              IMAGE[<slot>] picks llama / sd-server / comfyui)
 │   └── run.sh                    thin wrapper: delegates to docker-llm-switch
 │
 ├── tools/
@@ -118,7 +124,8 @@ A slot lives in four files that must stay in sync. Change one, change all:
 | OOM victim selection | `OOMScoreAdjust=200` | `--oom-score-adj=200` |
 | Boot-time auto-start | `systemctl --user enable <slot>` | `--restart unless-stopped` |
 | Respawn burst limit | `StartLimitBurst=3` | (none; relies on mutual exclusion) |
-| `imagine` / `comfyui` | `flux-klein.service`, host ComfyUI | not in scope — out-of-stack images |
+| `imagine` slot | `flux-klein.service` (sd-server) | `spark-llm-imagine` (from `docker/sd-server/Dockerfile`) |
+| `comfyui` slot | `comfyui.service` (host install) | `spark-llm-comfyui` (from `docker/comfyui/Dockerfile`) |
 
 ---
 
@@ -154,18 +161,27 @@ A slot lives in four files that must stay in sync. Change one, change all:
   `LLAMA_REF=master` ships mainline llama.cpp (~23 t/s on Qwen3.6-27B).
   For full perf (~28 t/s), build with `--build-arg LLAMA_REF=<mtp-sha>`
   pointing at the pre-merge MTP branch the systemd `*.service` files use.
-- **What's not in the Docker path**: the `imagine` (FLUX.2-klein) and
-  `comfyui` slots need separate images (stable-diffusion.cpp and ComfyUI
-  respectively). Use the systemd path for those.
+- **FLUX (imagine) and ComfyUI** are in the Docker path as separate
+  images, built from `docker/sd-server/` and `docker/comfyui/`. Both share
+  the same `--network=host` + bind-mounted-models pattern as the llama
+  slots. ComfyUI additionally bind-mounts `~/comfyui/{custom_nodes,output,user}`
+  so anything you install via the Manager web UI persists across rebuilds.
+- **ComfyUI OOM warning**: ComfyUI on Blackwell unified memory has a
+  known issue (Comfy-Org/ComfyUI#11106) where chaining VAE Decode with
+  Depth nodes can spike past 128 GB in seconds. The image already passes
+  `--disable-pinned-memory` and `--reserve-vram 2.0` to mitigate; if you
+  still hit it, batch in smaller tiles and avoid forcing `--gpu-only`.
 
 ### Commands
 
 Run these from the repo root.
 
 ```bash
-# 1. Build the image (build context is the repo root so tools/flux-gen
-#    is reachable; --build-arg LLAMA_REF lets you pin the MTP branch).
-docker build -f docker/Dockerfile -t spark-llm-stack .
+# 1. Build all three images (llama / sd-server / comfyui). Build context
+#    is the repo root so tools/flux-gen is reachable for the llama image.
+#    Override LLAMA_REF / COMFYUI_REF / SD_REF via --build-arg to pin.
+docker compose -f docker/docker-compose.yml build
+# (or build a single image: `docker compose -f docker/docker-compose.yml build comfyui`)
 
 # 2. Install the container manager on PATH (one-time).
 cp docker/docker-llm-switch ~/.local/bin/
@@ -177,6 +193,8 @@ chmod +x ~/.local/bin/docker-llm-switch
 ./docker/run.sh gemma            # gemma 31B, :8156
 ./docker/run.sh vision           # gemma vision, :8155
 ./docker/run.sh gptoss           # gpt-oss-20B, :8157
+./docker/run.sh imagine          # FLUX.2-klein via sd-server, :8160
+./docker/run.sh comfyui          # ComfyUI on :8188
 
 # 4. Manage state
 docker-llm-switch status         # what's running, ports, restart policy
@@ -187,6 +205,17 @@ docker-llm-switch boot-default architect   # only one slot ever has a policy
 docker-llm-switch boot-status              # show what'll start at daemon boot
 docker-llm-switch boot-safe                # clear all restart policies
 ```
+
+### Custom nodes for ComfyUI
+
+The container's `/opt/ComfyUI/custom_nodes/` is a bind mount of
+`~/comfyui/custom_nodes/` on the host. The image seeds ComfyUI-Manager
+into that directory on first run (no-clobber, so anything you've added
+is preserved across restarts and image rebuilds). Install new nodes
+through the Manager web UI or by `git clone`-ing into
+`~/comfyui/custom_nodes/` directly — restart the container to pick them
+up. Workflows / settings live in `~/comfyui/user/`, generated images in
+`~/comfyui/output/`.
 
 First-time HF download example (one-off, fills `~/models/`):
 

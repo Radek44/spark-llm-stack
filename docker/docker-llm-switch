@@ -3,7 +3,7 @@
 # Same UX, but manages spark-llm-stack containers instead of systemd user units.
 #
 # Runtime commands:
-#   docker-llm-switch [coder|architect|gemma|vision|gptoss]
+#   docker-llm-switch [coder|architect|gemma|vision|gptoss|imagine|comfyui]
 #   docker-llm-switch off
 #   docker-llm-switch status
 #
@@ -20,15 +20,16 @@
 
 set -euo pipefail
 
-IMAGE="${SPARK_IMAGE:-spark-llm-stack}"
 MODELS_DIR="${MODELS_DIR:-$HOME/models}"
+COMFY_DIR="${COMFY_DIR:-$HOME/comfyui}"
 PREFIX="spark-llm-"
 WAIT_TIMEOUT=300
 
-SLOTS=(coder architect gemma vision gptoss)
+SLOTS=(coder architect gemma vision gptoss imagine comfyui)
 
 declare -A PORTS=(
   [coder]=8152 [architect]=8154 [gemma]=8156 [vision]=8155 [gptoss]=8157
+  [imagine]=8160 [comfyui]=8188
 )
 declare -A ROLES=(
   [coder]="qwen3.6-27B    fast coding, MTP 70%+"
@@ -36,12 +37,28 @@ declare -A ROLES=(
   [gemma]="gemma4-31B     alt reasoning + image input"
   [vision]="gemma4-E4B     fast vision + audio input"
   [gptoss]="gpt-oss-20B    fast general, OpenAI style"
+  [imagine]="flux.2-klein  image generation (sd-server)"
+  [comfyui]="ComfyUI       diffusion UI + workflows"
 )
 declare -A MEMCAP=(
   [coder]=80g [architect]=80g [gemma]=80g [vision]=20g [gptoss]=40g
+  [imagine]=16g [comfyui]=40g
 )
 declare -A MEMSOFT=(
   [coder]=70g [architect]=70g [gemma]=70g [vision]=15g [gptoss]=30g
+  [imagine]=12g [comfyui]=30g
+)
+# Per-slot image. Llama slots all share one image (different CMD per slot);
+# imagine and comfyui get their own images built from docker/sd-server and
+# docker/comfyui respectively. Override individually via SPARK_IMAGE_<slot>.
+declare -A IMAGE=(
+  [coder]="${SPARK_IMAGE:-spark-llm-stack}"
+  [architect]="${SPARK_IMAGE:-spark-llm-stack}"
+  [gemma]="${SPARK_IMAGE:-spark-llm-stack}"
+  [vision]="${SPARK_IMAGE:-spark-llm-stack}"
+  [gptoss]="${SPARK_IMAGE:-spark-llm-stack}"
+  [imagine]="${SPARK_IMAGE_IMAGINE:-spark-llm-imagine}"
+  [comfyui]="${SPARK_IMAGE_COMFYUI:-spark-llm-comfyui}"
 )
 
 # ── slot CMD args (mirror the *.service ExecStart, with --host 0.0.0.0) ───────
@@ -132,6 +149,28 @@ CMD_gptoss=(
   --keep -1 --metrics --slots
 )
 
+# sd-server (FLUX.2-klein-4B). Mirrors systemd/units/flux-klein.service
+# with --listen-ip 0.0.0.0 (host network → must bind all interfaces).
+CMD_imagine=(
+  --diffusion-model /models/flux2-klein/flux-2-klein-4b.safetensors
+  --llm /models/flux2-klein/text_encoder/qwen_3_4b.safetensors
+  --vae /models/flux2-klein/ae.safetensors
+  --listen-ip 0.0.0.0
+  --listen-port 8160
+  --diffusion-fa
+  --type f16
+  --threads 8
+)
+
+# ComfyUI. Listen on 0.0.0.0 (host network), and the Grace-unified-memory
+# safety flags (see docker/comfyui/Dockerfile for the full rationale).
+CMD_comfyui=(
+  --listen 0.0.0.0
+  --port 8188
+  --disable-pinned-memory
+  --reserve-vram 2.0
+)
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 ctr_name() { echo "${PREFIX}$1"; }
@@ -180,16 +219,36 @@ stop_all_except() {
   done
 }
 
+probe_ready() {
+  # Try slot-specific endpoints first, fall back to /health and /.
+  # Matches the order in systemd/llm-switch's wait_ready.
+  local port="$1" slot="$2"
+  case "$slot" in
+    imagine)
+      curl -sf "http://127.0.0.1:$port/sdcpp/v1/capabilities" >/dev/null 2>&1
+      ;;
+    comfyui)
+      curl -sf "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1
+      ;;
+    *)
+      curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1
+      ;;
+  esac
+}
+
 wait_ready() {
   local slot="$1" port="${PORTS[$1]}" elapsed=0
   local name; name=$(ctr_name "$slot")
   echo -n "  waiting for $slot on :$port"
-  while ! curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
+  # ComfyUI cold-starts ~60-90s on first model load; allow it more slack.
+  local timeout=$WAIT_TIMEOUT
+  [ "$slot" = "comfyui" ] && timeout=600
+  while ! probe_ready "$port" "$slot"; do
     if [ "$(ctr_state "$name")" != "running" ]; then
       echo " FAILED (container exited)"; exit 1
     fi
     sleep 2; elapsed=$((elapsed+2)); echo -n "."
-    [ $elapsed -ge $WAIT_TIMEOUT ] && { echo " TIMEOUT"; exit 1; }
+    [ $elapsed -ge $timeout ] && { echo " TIMEOUT"; exit 1; }
   done
   echo " ready (${elapsed}s)"
 }
@@ -201,7 +260,28 @@ docker_run_slot() {
   local name; name=$(ctr_name "$slot")
   local mem="${MEMCAP[$slot]}"
   local memsoft="${MEMSOFT[$slot]}"
+  local image="${IMAGE[$slot]}"
   declare -n cmd_ref="CMD_${slot}"
+
+  # Per-slot extra mounts. ComfyUI needs writable host paths for the
+  # custom_nodes seed (see docker/comfyui/entrypoint.sh) and the output
+  # directory so generated images survive container restarts.
+  local -a extra_mounts=()
+  case "$slot" in
+    comfyui)
+      mkdir -p "${COMFY_DIR}/custom_nodes" "${COMFY_DIR}/output" "${COMFY_DIR}/user"
+      extra_mounts+=(
+        -v "${MODELS_DIR}:/opt/ComfyUI/models"
+        -v "${COMFY_DIR}/custom_nodes:/opt/ComfyUI/custom_nodes"
+        -v "${COMFY_DIR}/output:/opt/ComfyUI/output"
+        -v "${COMFY_DIR}/user:/opt/ComfyUI/user"
+      )
+      ;;
+    *)
+      extra_mounts+=(-v "${MODELS_DIR}:/models")
+      ;;
+  esac
+
   docker run -d --name "$name" "$@" \
     --gpus=all --network=host \
     --memory="$mem" --memory-swap="$mem" \
@@ -209,9 +289,9 @@ docker_run_slot() {
     --oom-score-adj=200 \
     --ulimit memlock=-1:-1 \
     --shm-size=1g \
-    -v "${MODELS_DIR}:/models" \
+    "${extra_mounts[@]}" \
     -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}" \
-    "${IMAGE}" \
+    "$image" \
     "${cmd_ref[@]}" >/dev/null
 }
 
@@ -334,7 +414,7 @@ boot_status() {
 CMD="${1:-status}"
 
 case "$CMD" in
-  coder|architect|gemma|vision|gptoss)
+  coder|architect|gemma|vision|gptoss|imagine|comfyui)
     target=$(ctr_name "$CMD")
     echo "→ $CMD mode (${ROLES[$CMD]})"
     stop_all_except "$target"
@@ -389,8 +469,11 @@ Boot (Docker daemon restart policy):
 Slots: ${SLOTS[*]}
 
 Env overrides:
-  SPARK_IMAGE  (default: spark-llm-stack)
-  MODELS_DIR   (default: \$HOME/models)
+  SPARK_IMAGE          llama slots image (default: spark-llm-stack)
+  SPARK_IMAGE_IMAGINE  sd-server image    (default: spark-llm-imagine)
+  SPARK_IMAGE_COMFYUI  ComfyUI image      (default: spark-llm-comfyui)
+  MODELS_DIR           host model dir     (default: \$HOME/models)
+  COMFY_DIR            host comfyui dir   (default: \$HOME/comfyui)
 EOF
     ;;
   *)

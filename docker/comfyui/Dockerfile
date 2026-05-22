@@ -1,0 +1,124 @@
+# ComfyUI for NVIDIA DGX Spark (GB10 Grace Blackwell, aarch64, SM 12.1).
+# Listens on :8188; bind to 0.0.0.0 so Tailscale traffic on the host's
+# tailscale0 interface reaches the server.
+#
+# Build (from repo root):
+#   docker build -f docker/comfyui/Dockerfile -t spark-llm-comfyui .
+#   docker build -f docker/comfyui/Dockerfile --build-arg COMFYUI_REF=<sha> \
+#     -t spark-llm-comfyui .
+#
+# Blackwell aarch64 notes (consensus across DGX Spark community work):
+# - TORCH_CUDA_ARCH_LIST=12.1a targets sm_121a SASS specifically.
+# - SageAttention is the only working fast-attention kernel on GB10
+#   (FlashAttention 2/3 has no sm_121 aarch64 wheels).
+# - torch.compile emits broken SASS for sm_121a → TORCH_COMPILE_DISABLE=1.
+# - --disable-pinned-memory + --reserve-vram 2.0 cooperate with Grace's
+#   unified-memory fabric (avoids the ComfyUI VAE Decode RAM spike
+#   reported in Comfy-Org/ComfyUI#11106).
+
+ARG CUDA_VERSION=13.2.0
+ARG UBUNTU_VERSION=24.04
+
+# ── builder ────────────────────────────────────────────────────────────────────
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI
+ARG COMFYUI_REF=master
+ARG SAGE_REPO=https://github.com/thu-ml/SageAttention
+ARG SAGE_REF=main
+ARG TORCH_VERSION=2.9.1
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VENV=/opt/venv \
+    PATH=/opt/venv/bin:/usr/local/cuda/bin:$PATH \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TORCH_CUDA_ARCH_LIST=12.1a \
+    TORCH_COMPILE_DISABLE=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-venv \
+    python3.12-dev \
+    git \
+    ninja-build \
+    build-essential \
+    cmake \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13/compat:${LD_LIBRARY_PATH}
+
+RUN python3.12 -m venv ${VENV} && \
+    pip install --upgrade pip setuptools wheel
+
+# PyTorch first so SageAttention links against the same ABI.
+RUN pip install --index-url ${TORCH_INDEX} \
+      torch==${TORCH_VERSION} torchvision torchaudio
+
+# ComfyUI itself — hard-fail on bad ref (same pattern as the llama Dockerfile).
+WORKDIR /build
+RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} ComfyUI
+WORKDIR /build/ComfyUI
+RUN pip install -r requirements.txt
+
+# SageAttention with sm_121a SASS. FlashAttention 2/3 has no working
+# aarch64 wheel for SM 12.1; SageAttention v3 is the consensus alternative.
+WORKDIR /build
+RUN git clone --depth 1 --branch ${SAGE_REF} ${SAGE_REPO} SageAttention
+WORKDIR /build/SageAttention
+RUN NVCC_APPEND_FLAGS="-gencode=arch=compute_121a,code=sm_121a" \
+    pip install .
+
+# ── runtime ────────────────────────────────────────────────────────────────────
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    VENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TORCH_COMPILE_DISABLE=1 \
+    CUDA_MANAGED_FORCE_DEVICE_ALLOC=1 \
+    PYTORCH_ALLOC_CONF=expandable_segments:True \
+    HF_HUB_ENABLE_HF_TRANSFER=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    git \
+    curl \
+    tini \
+    libgomp1 \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13/compat:${LD_LIBRARY_PATH}
+
+# Application
+COPY --from=builder /opt/venv      /opt/venv
+COPY --from=builder /build/ComfyUI /opt/ComfyUI
+
+# Default custom_nodes live OUTSIDE the bind-mount target so they don't
+# get shadowed when the user mounts ~/comfyui/custom_nodes over
+# /opt/ComfyUI/custom_nodes. entrypoint.sh seeds them on first run.
+RUN git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager \
+      /opt/comfy-defaults/custom_nodes/ComfyUI-Manager
+
+COPY docker/comfyui/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+WORKDIR /opt/ComfyUI
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8188/system_stats || exit 1
+
+EXPOSE 8188
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+CMD [ \
+  "--listen", "0.0.0.0", \
+  "--port", "8188", \
+  "--disable-pinned-memory", \
+  "--reserve-vram", "2.0" \
+]

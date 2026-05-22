@@ -23,10 +23,10 @@ Each model slot (e.g. `coder`) is defined in **four parallel places** that must 
 |---|---|
 | `systemd/units/*.service` | Systemd unit; `ExecStart` is the authoritative arg set |
 | `systemd/llm-switch` | `SVCS[]`, `PORTS[]`, `ROLES[]` maps + wait logic |
-| `docker/docker-llm-switch` | `CMD_<slot>` array mirrors `ExecStart` with `--host 0.0.0.0` |
+| `docker/docker-llm-switch` | `CMD_<slot>` array mirrors `ExecStart` with `--host 0.0.0.0`; `IMAGE[<slot>]` picks which image runs the slot |
 | `systemd/harden-llm-stack.sh` | `SERVICES=()` array with `MemoryHigh/Max` and heavyweight flag |
 
-The Dockerfile `CMD` is the coder-slot default only (not per-slot); `docker/run.sh` is a thin wrapper that delegates to `docker-llm-switch`.
+Llama slots all share `spark-llm-stack`. The `imagine` and `comfyui` slots use their own images (`spark-llm-imagine` from `docker/sd-server/`, `spark-llm-comfyui` from `docker/comfyui/`) — set in `IMAGE[]` in `docker/docker-llm-switch`. The Dockerfile `CMD` is the coder-slot default only (not per-slot); `docker/run.sh` is a thin wrapper that delegates to `docker-llm-switch`.
 
 ## Installation workflow
 
@@ -58,14 +58,17 @@ Service files point to `%h/src/llama.cpp-mtp/build/bin/llama-server` (pre-merge 
 ## Docker workflow
 
 ```bash
-docker build -f docker/Dockerfile -t spark-llm-stack .
+# Build all three images (llama / sd-server / comfyui)
+docker compose -f docker/docker-compose.yml build
+
 cp docker/docker-llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/docker-llm-switch
-./docker/run.sh                   # coder slot
-./docker/run.sh architect         # architect slot
+./docker/run.sh                   # coder slot (llama)
+./docker/run.sh imagine           # FLUX.2-klein via sd-server
+./docker/run.sh comfyui           # ComfyUI on :8188
 docker-llm-switch status          # manage running containers
 ```
 
-`docker-llm-switch` does not cover `imagine` (FLUX) or `comfyui` — those require separate images.
+All seven slots (coder/architect/gemma/vision/gptoss/imagine/comfyui) are now in the Docker path. `imagine` and `comfyui` have their own Dockerfiles under `docker/sd-server/` and `docker/comfyui/`; llama slots share `docker/Dockerfile`. ComfyUI bind-mounts `~/comfyui/{custom_nodes,output,user}` so user-installed nodes survive image rebuilds.
 
 ## Hermes harness config
 
