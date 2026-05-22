@@ -390,7 +390,199 @@ vLLM requires `--ipc=host` (Docker flag) for proper shared memory access. Add to
 
 ---
 
-## 4. Summary of Recommended Changes
+## 4. Deep Configuration Analysis (Expanded Research)
+
+### A. llama.cpp / llama-server Advanced Configuration
+
+**Quantization Comparison on Grace Blackwell:**
+- Q4_K_M: 51.8% HumanEval pass rate (code gen), matches AWQ and BitsandBytes
+- Q5_K: High quality, ~3-4x compression vs F16
+- Q6_K: Best quality retention, ~6x compression
+- TurboQuant KV cache: 4.57x → 5.12x compression on long sequences
+
+**Threading Strategy for GB10:**
+- Grace CPU: 72 ARM cores (10× Cortex-X925 + 10× Cortex-A725, scaled version has more)
+- Current default: `--threads 8` (conservative)
+- ARM Learning Path recommendation: `make -j$(nproc)` (all 20 efficiency cores)
+- SparkyUI tested: `OMP_NUM_THREADS=20`
+- Recommendation: Test `--threads 16-32` range, profile on actual GB10
+
+**Flash Attention Performance:**
+- Benchmark (RTX PRO 4000 Blackwell, similar to sm_121a):
+  - Q4_0 without FA: 3628 t/s (prefill), 89.73 t/s (generation)
+  - Q4_0 with FA: 4078 t/s (prefill +12%), 92.54 t/s (generation +3%)
+- Confirmed working on CUDA; provides modest speedup
+
+**KV Cache Optimization (TurboQuant):**
+- Available via MTP branch: `--cache-type-k turbo3 --cache-type-v turbo3`
+- Block size tuning: 4.57x → 5.12x compression
+- Trade: Slight numerical precision loss for massive memory savings
+- Use for: Ultra-long sequences (>16K tokens), memory-constrained scenarios
+
+### B. stable-diffusion.cpp / FLUX Advanced Configuration
+
+**Weight Quantization Impact:**
+- F16 (current): 9 GB model weight, best quality, balanced
+- Q8_0: ~50% smaller than F16 (4.5 GB), slight quality loss
+- Q5_0/Q5_1: Further compression, visible quality loss on FLUX
+- Q4_0/Q4_1: Smallest, not recommended for FLUX (quality too degraded)
+- GGUF alternative: Pre-quantized GGUF models available via leejet/FLUX.2-klein-4B-GGUF
+
+**Scheduler Selection for FLUX:**
+- FLUX uses flow-matching (not traditional diffusion)
+- Not currently configurable in server startup
+- Should be client-side parameter (flux-gen requests)
+- Recommended: `--steps 4 --cfg-scale 1.0` (flow-matching specific)
+
+**Guidance Scale Tuning:**
+- Traditional diffusion: 7.5-15.0 range
+- FLUX flow-matching: 1.0 optimal (no classifier-free guidance needed)
+- Lower guidance: More variation in output
+- Higher guidance: Stricter prompt adherence
+
+**Thread Count for Text Encoder:**
+- Qwen text encoder computation is CPU-side
+- `--threads 8` current; Grace has 72 cores
+- CPU bottleneck likely for fast generations
+- Recommendation: Test `--threads 16-32` to keep Qwen from limiting generation speed
+
+**CUDA_SCALE_LAUNCH_QUEUES=4x:**
+- No explicit community testing found for GB10
+- Appears in stable-diffusion.cpp runtime environment
+- Internal CUDA/NCCL tuning parameter
+- Status: Safe to keep; no reported issues
+
+**VAE Decoding Optimization:**
+- Current approach: Use CUDA VAE decode (GPU-accelerated)
+- Alternative: TAESD (Tiny AutoEncoder) available via `--tae` flag
+- Trade: TAESD is faster but lower quality
+- Status: Not needed for current use case (generation speed not limited by VAE)
+
+### C. ComfyUI Unified Memory Optimization
+
+**Dynamic VRAM System (New in ComfyUI):**
+- Now default-enabled; massive memory optimization
+- Symptom if broken: Workflows consuming all VRAM despite `--reserve-vram` setting
+- Fix: Use `--disable-dynamic-vram` if reserve-vram not respected
+- With comfy-aimdo enabled: "DynamicVRAM support detected and enabled" logged
+- Status: Leave enabled; works with our configuration
+
+**Memory Allocation Environment Variables Explained:**
+- `PYTORCH_ALLOC_CONF=expandable_segments:True` — Dynamic segment expansion
+- `PYTORCH_NO_CUDA_MEMORY_CACHING=1` — Don't hoard freed GPU memory (correct for unified memory)
+- `CUDA_MANAGED_FORCE_DEVICE_ALLOC=1` — Force device-side allocation tracking
+- Combined effect: Allows OS to reclaim freed memory on unified fabric
+
+**Batch Size Critical Formula (4n+1):**
+- Applies to: ComfyUI, video diffusion (LTX), some LoRA workflows
+- Valid sizes: 1, 5, 9, 13, 17, 21, 25, ...
+- Reason: Some models have architectural optimization for these specific batch sizes
+- GB10 use: For parallel workflows, batch_size=5 or 9 ideal
+
+**SageAttention Version Stability:**
+- v2.2.0: Confirmed stable on sm_121a; no reported regressions
+- v3.x: Has reported mosaic visual artifact on GB10 (unfixed as of 2026-04)
+- Current Dockerfile: `SAGE_REF=main` (risky if main advances to v3)
+- Recommendation: Pin to `SAGE_REF=v2.2.0` to guard against upstream changes
+
+**Custom Node Memory Management:**
+- ComfyUI-Manager auto-installs nodes to bind-mounted `~/comfyui/custom_nodes/`
+- Seed approach (current): `/opt/comfy-defaults/custom_nodes/` → `cp -rn` at runtime
+- Advantage: User installs persist across image rebuilds
+- Memory consideration: Large custom node sets can fragment memory
+
+**VAE Decode Memory Spikes:**
+- Known issue: VAE decode significantly increases memory bus load
+- Symptom: Sudden OOM on final VAE step despite earlier success
+- Current mitigation: `--disable-pinned-memory` (prevents GPU memory caching during decode)
+- Alternative: Manual VAE tiling (not currently implemented)
+- Community: Triplany uses `--reserve-vram 8` specifically for this headroom
+
+**Global Precision Flags (Don't Use):**
+- `--force-fp16`, `--fp16-vae`, `--fp16-text-enc` broke LTX 2.3 (all-black output)
+- Reason: Models have specific dtype requirements; forcing breaks some architectures
+- ComfyUI auto-detects per-model; don't override globally
+- Status: Our approach (no global flags) is correct
+
+### D. vLLM Configuration for GB10
+
+**Image Selection Rationale:**
+- vLLM `main` branch: No guaranteed GB10 support
+- `v0.18.0-cu130`: Current stable, widely tested on GB10
+- `avarok/vllm-dgx-spark`: Best for MoE, includes non-gated activation fix
+- CUDA 13.x required; older versions don't recognize sm_121
+
+**Critical Environment Variable:**
+- `VLLM_FLASHINFER_MOE_BACKEND=latency` prevents MoE crash on GB10
+- Without it: "Failed to initialize cutlass TMA WS grouped gemm" error
+- Reason: `throughput` mode uses CUTLASS grouped GEMM (incompatible with SM 12.1)
+- `latency` mode: Alternative kernel path that works on Grace
+
+**GPU Memory Utilization Analysis:**
+- Recommended: 0.75-0.80 (safe headroom)
+- Testing range: 0.80-0.85 (may OOM under concurrent requests)
+- Danger: >0.85 (entire system can OOM on unified memory)
+- GB10 OOM behavior: Not isolated to container; affects whole system
+
+**Quantization Strategy on GB10:**
+- GB10 bandwidth-bottlenecked (LPDDR5X 273 GB/s vs HBM3 3.3 TB/s)
+- Result: 4-bit quantization provides 3.5× throughput vs FP16
+- Recommendation: Default to AWQ or GPTQ for all LLMs
+- Comparison (Qwen2.5-Coder-7B):
+  - BF16: 13 tok/s
+  - AWQ 4-bit: 46 tok/s (3.5× faster!)
+- MoE models: AWQ 4-bit achieves 33.7 tok/s on 80B sparse model
+
+**FP8 and Advanced Features:**
+- FP8 KV-cache: 2× memory savings, reduces KV memory pressure
+- Requires: Flash Attention 3 backend + llm-compressor calibration
+- Speculative decoding (EAGLE3): 2-3× speedup without quality loss
+- Prefix caching: Reuse common prefixes across requests
+
+### E. Hermes Multi-Model Router Configuration
+
+**Provider Alias Bug:**
+- Issue: `provider: vllm` with non-loopback `base_url` silently falls back to OpenRouter
+- Root cause: `_config_base_url_trustworthy_for_bare_custom()` only trusts "custom" type
+- Workaround: Always use `provider: custom` for non-localhost endpoints
+- Symptoms: "AuthenticationError [HTTP 401]" indicates fallback to OpenRouter
+
+**Parameter Passthrough Patterns:**
+- Model-specific temperature override in `models:` section
+- Per-model `top_k`, `top_p`, `seed` configuration
+- Sampler selection (where backend supports)
+- Context window configuration per model
+
+**Multi-Slot Integration with Spark Stack:**
+- Hermes connects to docker-llm-switch slots via localhost:PORT
+- Slot mapping: coder:8000, architect:8000, imagine:8160, comfyui:8188
+- Each slot has different model/config
+- Hermes config templates: One per slot with parameter overrides
+
+### F. Unified Memory Performance Best Practices
+
+**What NOT to do:**
+1. `--gpu-only` — Forces GPU-only memory, starves CPU, fights coherency
+2. `--disable-mmap` — Copies full weights into anonymous pages (not evictable)
+3. Global `--mlock` — Pins memory, starves other services
+4. `--no-mmap` — Similar to disable-mmap; forces copy burden
+
+**What TO do:**
+1. `PYTORCH_NO_CUDA_MEMORY_CACHING=1` — Let OS reclaim freed pages
+2. Dynamic weight streaming — Load/unload models as needed
+3. Async offload — Enabled by default in ComfyUI
+4. Batch size tuning — 4n+1 formula for reproducible performance
+5. Quantization — 4-bit provides 3.5× throughput on bandwidth-limited GB10
+
+**Host-level Stability:**
+- GPU clock locking: `nvidia-smi -lgc 3003,3003` prevents throttling
+- Boost slider: `nvidia-smi boost-slider --vboost 1` optimizes compute path
+- Persistence mode: `nvidia-smi -pm 1` reduces driver load latency
+- All settings reset at reboot on GB10 (firmware behavior)
+
+---
+
+## 5. Summary of Recommended Changes
 
 ### Apply immediately (low risk, clear community consensus):
 
@@ -421,7 +613,33 @@ vLLM requires `--ipc=host` (Docker flag) for proper shared memory access. Add to
 
 ---
 
-## 5. Sources
+## 6. Extended Sources (Deep Configuration Research)
+
+| URL | Date accessed | What it contributed |
+|-----|--------------|---------------------|
+| https://github.com/ggml-org/llama.cpp/discussions/15013 | 2026-05-22 | Flash attention performance on Blackwell (sm_120); Q4_0 benchmarks |
+| https://github.com/ggml-org/llama.cpp/discussions/20969 | 2026-05-22 | TurboQuant KV cache: 4.57x → 5.12x compression; MTP branch features |
+| https://jarvislabs.ai/blog/vllm-quantization-complete-guide-benchmarks | 2026-05-22 | AWQ vs GPTQ vs GGUF vs BitsandBytes quantization comparison |
+| https://docs.vllm.ai/en/stable/features/quantization/quantized_kvcache | 2026-05-22 | FP8 KV-cache quantization; per-attention-head vs per-tensor strategies |
+| https://www.youngju.dev/blog/llm/2026-03-14-llm-inference-optimization-vllm-tensorrt-speculative-decoding.en | 2026-05-22 | Speculative decoding (EAGLE3); PagedAttention memory efficiency |
+| https://www.youtube.com/watch?v=e85NzrAmb7U | 2026-05-22 | Hermes Agent Desktop + llama.cpp setup; model provider integration |
+| https://github.com/NousResearch/hermes-agent/issues/27132 | 2026-05-22 | Hermes provider alias bug; non-loopback URL fallback to OpenRouter |
+| https://github.com/NousResearch/hermes-agent/issues/523 | 2026-05-22 | Local Model Setup Skill proposal; Ollama/llama.cpp/vLLM integration |
+| https://github.com/Comfy-Org/ComfyUI/discussions/12699 | 2026-05-22 | Dynamic VRAM system; interaction with `--reserve-vram` flag |
+| https://www.reddit.com/r/comfyui/comments/1rhj51p/dynamic_vram_the_massive_memory_optimization_is/ | 2026-05-22 | ComfyUI dynamic VRAM issues; batch size optimization |
+| https://comfy.icu/extension/numz__ComfyUI-SeedVR2_VideoUpscaler | 2026-05-22 | Batch size 4n+1 formula; memory optimization for video upscaling |
+| https://comfyai.run/documentation/Pad%20Batch%20to%204n+1 | 2026-05-22 | Batch padding documentation; 4n+1 formula implementation |
+| https://blog.comfy.org/p/dynamic-vram-in-comfyui-saving-local | 2026-05-22 | Dynamic VRAM system; NVIDIA-backed optimization for local models |
+| https://docs.nvidia.com/deeplearning/tensorrt/latest/performance/hw-sw-environment.html | 2026-05-22 | GPU clock locking for stable performance; power throttling impact |
+| https://learn.arm.com/learning-paths/laptops-and-desktops/dgx_spark_rag/4_rag_memory_observation | 2026-05-22 | Unified memory monitoring; zero-copy data sharing on Grace-Blackwell |
+| https://docs.nvidia.com/dccpu/grace-perf-tuning-guide/index.html | 2026-05-22 | NVIDIA Grace CPU tuning; memory bandwidth (768 GB/s for superchip) |
+| https://www.reddit.com/r/learnmachinelearning/comments/1sb2wd1/we_built_epochly_a_zeroconfig_blackwell_gpu_cloud/ | 2026-05-22 | Epochly GB10 analysis; 128GB LPDDR5X unified memory characteristics |
+| https://www.clarifai.com/blog/nvidia-gh200-gpu-guide | 2026-05-22 | GH200 (Grace+Hopper) guide; unified memory architecture, bandwidth analysis |
+| https://github.com/leejet/stable-diffusion.cpp | 2026-05-22 | Official sd.cpp repo; quantization types, FLUX support details |
+
+---
+
+## 7. Original Sources (Phase 1 Research)
 
 | URL | Date accessed | What it contributed |
 |-----|--------------|---------------------|
