@@ -8,7 +8,7 @@ WIDTH="${2:-512}"
 HEIGHT="${3:-512}"
 STEPS="${4:-4}"
 SEED="${5:--1}"
-BASE="http://127.0.0.1:8160"
+BASE="${FLUX_HOST:-http://127.0.0.1:8160}"
 OUTDIR=~/flux-output
 mkdir -p "$OUTDIR"
 

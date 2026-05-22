@@ -57,10 +57,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     libcurl4 \
     ca-certificates \
+    python3 \
+    python3-requests \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/llama.cpp/build/bin/llama-server  /usr/local/bin/llama-server
 COPY --from=builder /build/llama.cpp/build/bin/llama-bench   /usr/local/bin/llama-bench
+
+# flux-gen is bundled so you can: docker exec <ctr> flux-gen "prompt"
+# It's an HTTP client; set FLUX_HOST=http://<addr>:8160 to target a remote server.
+COPY flux-gen /usr/local/bin/flux-gen
+RUN chmod +x /usr/local/bin/flux-gen
 
 # GB10 performance tuning (from qwen27-mtp.service and qwen35-mtp.service)
 ENV CUDA_SCALE_LAUNCH_QUEUES=4x
