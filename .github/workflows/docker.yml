@@ -1,0 +1,66 @@
+name: docker
+
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+      - "tools/flux-gen"
+      - ".github/workflows/docker.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - "tools/flux-gen"
+      - ".github/workflows/docker.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint:
+    name: Dockerfile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # BuildKit's `check` frontend lints the Dockerfile (deprecated flags,
+      # unset ARGs, stale base images, etc.) without compiling anything.
+      # No GPU needed — we never build the CUDA stages here.
+      - name: Lint Dockerfile
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          call: check
+
+  scout:
+    name: Scout base-image scan
+    runs-on: ubuntu-latest
+    # Scan only on PRs and main pushes; skip on forks (no token).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      # Scout can scan an image reference directly — no need to build the
+      # GB10-specific runtime image. We point it at the runtime base used
+      # in docker/Dockerfile (only thing in the final image we didn't write).
+      - name: Resolve base image from Dockerfile
+        id: base
+        run: |
+          cuda=$(awk -F= '/^ARG CUDA_VERSION=/{print $2}' docker/Dockerfile)
+          ubuntu=$(awk -F= '/^ARG UBUNTU_VERSION=/{print $2}' docker/Dockerfile)
+          echo "image=nvidia/cuda:${cuda}-runtime-ubuntu${ubuntu}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker Scout — CVEs (high/critical)
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: ${{ steps.base.outputs.image }}
+          only-severities: critical,high
+          exit-code: false
+          summary: true
