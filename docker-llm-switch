@@ -50,7 +50,7 @@ CMD_coder=(
   -m /models/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf
   --alias qwen3.6-27b-coder
   --host 0.0.0.0 --port 8152
-  -ngl 999 -fa on -c 131072
+  -ngl 999 -fa on -c 262144
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
   --ctx-checkpoints 128 --cache-reuse 1024
@@ -68,7 +68,7 @@ CMD_architect=(
   -m /models/Qwen3.6-35B-A3B-MTP-Q4_K_XL.gguf
   --alias qwen3.6-35b-architect
   --host 0.0.0.0 --port 8154
-  -ngl 999 -fa on -c 131072
+  -ngl 999 -fa on -c 262144
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
   --ctx-checkpoints 64 --cache-reuse 1024
@@ -86,7 +86,7 @@ CMD_gemma=(
   -m /models/gemma-4-31B-it-UD-Q4_K_XL.gguf
   --alias gemma4-31b
   --host 0.0.0.0 --port 8156
-  -ngl 999 -fa on -c 131072
+  -ngl 999 -fa on -c 262144
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
   --ctx-checkpoints 64 --cache-reuse 1024
@@ -160,6 +160,18 @@ ctr_autoremove() {
   docker inspect --format '{{.HostConfig.AutoRemove}}' "$1" 2>/dev/null || echo ""
 }
 
+# Force-remove a container name and wait for Docker's async auto-remove to
+# settle, so a subsequent `docker run --name "$name"` can't race the cleanup.
+ensure_absent() {
+  local name="$1"
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$(ctr_state "$name")" = "absent" ] && return 0
+    sleep 0.5
+  done
+  return 0
+}
+
 stop_all_except() {
   local keep="$1"
   for slot in "${SLOTS[@]}"; do
@@ -198,6 +210,7 @@ docker_run_slot() {
     --gpus=all --network=host \
     --memory="$mem" --memory-swap="$mem" \
     --memory-reservation="$memsoft" \
+    --oom-score-adj=200 \
     --ulimit memlock=-1:-1 \
     --shm-size=1g \
     -v "${MODELS_DIR}:/models" \
@@ -210,9 +223,10 @@ run_slot() {
   local slot="$1"
   local name; name=$(ctr_name "$slot")
 
-  # If an old (stopped) container exists with the same name, remove it.
-  if [ "$(ctr_state "$name")" = "exited" ]; then
-    docker rm "$name" >/dev/null
+  # If an old container exists with the same name (or auto-remove is mid-flight),
+  # clear it before `docker run --name` races the cleanup.
+  if [ "$(ctr_state "$name")" != "absent" ]; then
+    ensure_absent "$name"
   fi
 
   # Runtime mode: --rm so an OOM-killed container is removed, not respawned
@@ -230,7 +244,10 @@ show_status() {
     local state boot
     state=$(ctr_state "$name")
     boot=$(ctr_restart_policy "$name")
-    [ "$boot" = "on-failure" ] && boot="enabled" || boot="disabled"
+    case "$boot" in
+      on-failure)  boot="enabled" ;;
+      ""|no)       boot="disabled" ;;
+    esac
     [ "$state" = "absent" ] && boot="-"
     printf "  %-10s %-22s %-10s %-9s %s\n" \
       "$slot" "$name (:$port)" "$state" "$boot" "${ROLES[$slot]}"
@@ -260,16 +277,18 @@ boot_default() {
     exit 1
   fi
   local keep; keep=$(ctr_name "$slot")
-  echo "→ setting $slot as Docker boot-default (clears restart policy on others)"
+  echo "→ setting $slot as Docker boot-default (stops + clears restart policy on others)"
   echo "  using --restart on-failure:3 (matches StartLimitBurst=3 + OOMPolicy=stop"
   echo "  from POSTMORTEM hardening — prevents OOM respawn brick loop)"
+
+  stop_all_except "$keep"
 
   for s in "${SLOTS[@]}"; do
     local name; name=$(ctr_name "$s")
     if [ "$name" = "$keep" ]; then
       case "$(ctr_state "$name")" in
         absent|exited)
-          [ "$(ctr_state "$name")" = "exited" ] && docker rm "$name" >/dev/null
+          [ "$(ctr_state "$name")" = "exited" ] && ensure_absent "$name"
           docker_run_slot "$slot" --restart on-failure:3
           echo "  $s: created with --restart on-failure:3"
           ;;
@@ -282,7 +301,7 @@ boot_default() {
           if [ "$(ctr_autoremove "$name")" = "true" ]; then
             echo "  $s: running with --rm; recreating with --restart on-failure:3"
             docker stop "$name" >/dev/null
-            [ "$(ctr_state "$name")" = "exited" ] && docker rm "$name" >/dev/null 2>&1 || true
+            ensure_absent "$name"
             docker_run_slot "$slot" --restart on-failure:3
           elif [ "$(ctr_restart_policy "$name")" = "on-failure" ] \
                && [ "$(ctr_restart_max "$name")" = "3" ]; then
@@ -373,7 +392,7 @@ Runtime:
 Boot (Docker daemon restart policy):
   docker-llm-switch boot-safe       clear --restart on all slots
   docker-llm-switch boot-default <slot>
-                                    set ONE slot to --restart unless-stopped
+                                    set ONE slot to --restart on-failure:3
   docker-llm-switch boot-status     show what auto-starts at Docker boot
 
 Slots: ${SLOTS[*]}

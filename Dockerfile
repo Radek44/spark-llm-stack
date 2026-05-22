@@ -38,11 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV LD_LIBRARY_PATH=/usr/local/cuda-13/compat:${LD_LIBRARY_PATH}
 
 WORKDIR /build
-RUN git clone --depth 1 --branch ${LLAMA_REF} ${LLAMA_REPO} llama.cpp 2>/dev/null \
- || git clone --depth 1 ${LLAMA_REPO} llama.cpp && \
-    cd llama.cpp && \
-    git fetch --depth 1 origin ${LLAMA_REF} && \
-    git checkout FETCH_HEAD 2>/dev/null || true
+# Hard-fail on bad LLAMA_REF — silent fallback to master masked perf regressions.
+# `--branch` accepts both branch names and tags. To pin a SHA, override LLAMA_REF
+# with a branch/tag that points at it, or remove `--depth 1` and `git checkout` it.
+RUN git clone --depth 1 --branch ${LLAMA_REF} ${LLAMA_REPO} llama.cpp
 
 WORKDIR /build/llama.cpp
 RUN cmake -B build -G Ninja \
@@ -104,7 +103,7 @@ CMD [ \
   "--port", "8152", \
   "-ngl", "999", \
   "-fa", "on", \
-  "-c", "131072", \
+  "-c", "262144", \
   "--cache-type-k", "q8_0", \
   "--cache-type-v", "q8_0", \
   "--kv-unified", \
