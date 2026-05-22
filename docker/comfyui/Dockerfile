@@ -85,7 +85,7 @@ RUN pip install 'comfy-aimdo>=0.3.0'
 # Fix: replace the CUDA call with psutil.virtual_memory().available, which
 # reads /proc/meminfo and returns the true host available RAM. On GB10 this is
 # the ground truth because system RAM = GPU memory (unified pool).
-RUN python3 -c "
+RUN python3 <<'PYEOF'
 import pathlib, sys
 f = pathlib.Path('comfy/model_management.py')
 if not f.exists():
@@ -99,7 +99,7 @@ if old not in txt:
     sys.exit(0)
 f.write_text(txt.replace(old, new, 1))
 print('model_management.py patched: cudaMemGetInfo -> psutil.virtual_memory().available')
-"
+PYEOF
 
 # SageAttention with sm_121a SASS. FlashAttention 2/3 has no working
 # aarch64 wheel for SM 12.1; SageAttention v3 is the consensus alternative.
