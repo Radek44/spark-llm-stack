@@ -569,7 +569,7 @@ bash systemd/harden-llm-stack.sh --revert # remove all drop-ins
 |---|---|---|
 | `--no-mmap` | **removed** | Anonymous pages can't be evicted on unified memory. Page cache is safer. |
 | `--mlock` | **removed** | Pins entire model permanently, starves other services. |
-| `-c 262144` | optional | Lower to `131072` for typical tasks; 256K context is rarely needed. |
+| `-c 131072` | **default** (128K) | Lowered from 262144 (256K). Halves KV cache footprint; unlocks `--parallel 2` headroom within the 80 G MemoryMax. To bump a specific slot back to 256K, edit `-c 131072` in both `systemd/units/<slot>.service` and the matching `CMD_<slot>` in `docker/docker-llm-switch`, then `systemctl --user daemon-reload` (or rebuild the image). See [`docs/architecture/DECISIONS.md`](docs/architecture/DECISIONS.md) §11. |
 
 ### Pre-reboot checklist
 

@@ -131,17 +131,26 @@ This change is unvalidated on hardware. `LLAMACPP_TUNING_PLAN.md` and
 `LLAMACPP_BASELINE_RESULTS.md` on `cr1` describe the benchmark
 methodology to validate it. Rollback is `git revert`.
 
-## 11. Why we did NOT bump `--parallel 1 → 2`
+## 11. Context window `-c 131072` (was `262144`) — and the now-available `--parallel 2`
 
-Research recommends "test --parallel 2-4" on bandwidth-limited systems.
-We didn't apply it because of the memory math: at `-c 262144` with
-`q8_0/q8_0` KV, one slot consumes ~48 GB (`--cache-ram 49152`). Doubling
-to `--parallel 2` doubles the KV footprint to ~96 GB, exceeding the 80 G
-`MemoryMax` cap on the heavy slots. The only way to safely test
-`--parallel 2` is to first cut `-c` to 131072 (128K), which is a
-larger product decision (the README documents 256K as rarely needed but
-the choice has been stable). Deferred until either the context is
-reduced or the benchmark plan on `cr1` confirms it's worth the trade.
+Default context window on the heavy slots (coder, architect, gemma)
+was lowered from 256K to 128K tokens. gptoss and vision were already
+128K. Rationale: real-world usage rarely exceeds 128K, and at 256K
+with `q8_0/q8_0` KV one slot consumed ~48 GB just for cache, leaving
+no headroom under the 80 G `MemoryMax` cap.
+
+To go back to 256K on a specific slot, edit `-c 131072` in both
+`systemd/units/<slot>.service` and the matching `CMD_<slot>` array in
+`docker/docker-llm-switch`, then `systemctl --user daemon-reload` (or
+rebuild the Docker image). The README "Hardening" section documents
+this trade.
+
+**`--parallel 2` is now safe but not enabled.** At 128K the KV footprint
+halves to ~24 GB, so `--parallel 2` fits in the 80 G cap. We didn't flip
+it because doubling parallel changes user-facing behavior under load
+(two concurrent requests share the slot's compute, halving per-request
+throughput). Enable it when the use case actually wants concurrent
+requests (e.g. multi-client coder slot), not preemptively.
 
 ## 12. Why we did NOT adopt the 4n+1 batch-size formula for llama.cpp
 
@@ -200,15 +209,23 @@ request off-box. Source: CONFIG_GUIDE.md §5/§6 on `cr1`.
 
 ## Deferred / open items
 
-- **`LLAMA_REF` pin to a specific MTP SHA** (decision 3) — needs a known-
-  good commit nominated by the maintainer.
+Tracked here because there's no external reminder system — these are the
+follow-ups that need user input or hardware access before they can move.
+
+- **`LLAMA_REF` pin to a specific MTP SHA** (decision 3) — needs a
+  known-good commit. To produce one, on the Spark host run:
+  `cd ~/src/llama.cpp-mtp && git rev-parse HEAD && git log -1 --format='%ci %s'`
+  Once nominated, change `docker/Dockerfile`'s `ARG LLAMA_REF=master`
+  default to that SHA.
 - **Run `LLAMACPP_TUNING_PLAN.md` benchmark on hardware** (decision 10) —
-  fills in `LLAMACPP_BASELINE_RESULTS.md` on `cr1` and validates the
-  16/24 threading change.
-- **Reduce `-c` from 262144 → 131072 on heavy slots** (decision 11) —
-  prerequisite for testing `--parallel 2`.
+  validates the 16/24 threading change. Plan + result template live on
+  `cr1` under `docs/research/`. Needs `llama-bench` + concurrent `curl`
+  against `llama-server` on the Spark; no shortcut.
+- **Enable `--parallel 2` on a chosen slot** (decision 11) — now
+  memory-safe at 128K context; un-gated by a product decision (do you
+  want concurrent requests sharing a slot?).
 - **Adopt vLLM as an 8th slot** (decision 13) — only if measured
   throughput ceiling actually justifies it.
-- **Adopt `docker/autoresearch/` runtime** (lives on `cr1`) — separate
-  workstream from the inference stack; merge if/when the workflow is
-  promoted to production use.
+- **Adopt `docker/autoresearch/` runtime** — lives on `cr1` and is being
+  actively edited there. Do not cherry-pick onto this branch until cr1
+  is settled.
