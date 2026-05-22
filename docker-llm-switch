@@ -166,30 +166,27 @@ stop_all_except() {
 
 wait_ready() {
   local slot="$1" port="${PORTS[$1]}" elapsed=0
+  local name; name=$(ctr_name "$slot")
   echo -n "  waiting for $slot on :$port"
   while ! curl -sf "http://127.0.0.1:$port/health" >/dev/null 2>&1; do
+    if [ "$(ctr_state "$name")" != "running" ]; then
+      echo " FAILED (container exited)"; exit 1
+    fi
     sleep 2; elapsed=$((elapsed+2)); echo -n "."
     [ $elapsed -ge $WAIT_TIMEOUT ] && { echo " TIMEOUT"; exit 1; }
   done
   echo " ready (${elapsed}s)"
 }
 
-run_slot() {
-  local slot="$1"
+# Shared `docker run` for a slot. Caller passes lifecycle flags as
+# extra args (e.g. `--rm` for runtime, `--restart on-failure:3` for boot-default).
+docker_run_slot() {
+  local slot="$1"; shift
   local name; name=$(ctr_name "$slot")
   local mem="${MEMCAP[$slot]}"
   local memsoft="${MEMSOFT[$slot]}"
   declare -n cmd_ref="CMD_${slot}"
-
-  # If an old (stopped) container exists with the same name, remove it.
-  if [ "$(ctr_state "$name")" = "exited" ]; then
-    docker rm "$name" >/dev/null
-  fi
-
-  # Runtime mode: --rm so an OOM-killed container is removed, not respawned
-  # (Docker analogue of OOMPolicy=stop from the POSTMORTEM hardening).
-  docker run -d --name "$name" \
-    --rm \
+  docker run -d --name "$name" "$@" \
     --gpus=all --network=host \
     --memory="$mem" --memory-swap="$mem" \
     --memory-reservation="$memsoft" \
@@ -199,6 +196,20 @@ run_slot() {
     -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}" \
     "${IMAGE}" \
     "${cmd_ref[@]}" >/dev/null
+}
+
+run_slot() {
+  local slot="$1"
+  local name; name=$(ctr_name "$slot")
+
+  # If an old (stopped) container exists with the same name, remove it.
+  if [ "$(ctr_state "$name")" = "exited" ]; then
+    docker rm "$name" >/dev/null
+  fi
+
+  # Runtime mode: --rm so an OOM-killed container is removed, not respawned
+  # (Docker analogue of OOMPolicy=stop from the POSTMORTEM hardening).
+  docker_run_slot "$slot" --rm
 }
 
 show_status() {
@@ -251,25 +262,17 @@ boot_default() {
       case "$(ctr_state "$name")" in
         absent|exited)
           [ "$(ctr_state "$name")" = "exited" ] && docker rm "$name" >/dev/null
-          local mem="${MEMCAP[$slot]}"
-          local memsoft="${MEMSOFT[$slot]}"
-          declare -n cmd_ref="CMD_${slot}"
-          docker run -d --name "$name" \
-            --restart on-failure:3 \
-            --gpus=all --network=host \
-            --memory="$mem" --memory-swap="$mem" \
-            --memory-reservation="$memsoft" \
-            --ulimit memlock=-1:-1 \
-            --shm-size=1g \
-            -v "${MODELS_DIR}:/models" \
-            -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}" \
-            "${IMAGE}" \
-            "${cmd_ref[@]}" >/dev/null
+          docker_run_slot "$slot" --restart on-failure:3
           echo "  $s: created with --restart on-failure:3"
           ;;
         running)
-          docker update --restart on-failure --restart-max-retries 3 "$name" >/dev/null
-          echo "  $s: already running, restart policy → on-failure:3"
+          # Running containers were started by run_slot with --rm, so
+          # `docker update --restart` would fail. Stop and recreate without
+          # --rm so the on-failure:3 policy actually applies at next boot.
+          echo "  $s: already running with --rm; recreating with --restart on-failure:3"
+          docker stop "$name" >/dev/null
+          [ "$(ctr_state "$name")" = "exited" ] && docker rm "$name" >/dev/null 2>&1 || true
+          docker_run_slot "$slot" --restart on-failure:3
           ;;
       esac
     else
