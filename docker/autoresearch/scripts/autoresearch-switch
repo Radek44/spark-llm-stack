@@ -54,10 +54,20 @@ else
     docker ps -q --filter "name=spark-" | xargs -r docker stop -t 10 >/dev/null 2>&1 || true
   }
   spark_parse_gb() {
-    local r="${1:-0}"
-    r=$(printf '%s' "$r" | tr '[:upper:]' '[:lower:]')
-    # %%g* greedy-strips everything from the first 'g' so "40gb" -> "40", not "40b".
-    case "$r" in *gb|*g) echo "${r%%g*}" ;; *) echo 0 ;; esac
+    # Mirror the real library's parser (docker/lib/spark-mem.sh) so the shim
+    # behaves identically when the lib is absent — otherwise an m/k-scale
+    # value in .env.autoresearch silently parses to 0 here, while the real
+    # lib would handle it.
+    local raw="${1:-0}"
+    raw=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$raw" in
+      ''|0) echo 0 ;;
+      *gb|*g) echo "${raw%%g*}" ;;
+      *mb|*m) echo $(( ${raw%%m*} / 1024 )) ;;
+      *kb|*k) echo $(( ${raw%%k*} / 1048576 )) ;;
+      *[!0-9]*) echo 0 ;;
+      *) echo $(( raw / 1073741824 )) ;;
+    esac
   }
 fi
 
