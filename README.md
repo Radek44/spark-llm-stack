@@ -4,7 +4,7 @@ Local LLM inference stack for **NVIDIA DGX Spark (GB10 Grace Blackwell)**.
 Two deployment paths over the same model roster — systemd user-services
 (primary) and Docker containers (mirror) — bound by a shared hardening
 contract that prevents the 128 GB unified-memory OOM brick-loop documented
-in [POSTMORTEM.md](POSTMORTEM.md).
+in [POSTMORTEM.md](reference-previous/POSTMORTEM.md).
 
 ## Repo structure
 
@@ -12,7 +12,7 @@ in [POSTMORTEM.md](POSTMORTEM.md).
 spark-llm-stack/
 ├── README.md                    ← you are here
 ├── CLAUDE.md                    contributor / agent guide
-├── POSTMORTEM.md                the OOM brick-loop incident; why hardening exists
+│
 │
 ├── systemd/                     PRIMARY path: user-services on the host
 │   ├── units/                     one .service per model slot (authoritative ExecStart)
@@ -49,7 +49,8 @@ spark-llm-stack/
 ├── config/
 │   └── hermes-config-snippet.yaml   provider stanzas for the Hermes harness
 │
-└── reference-previous/
+└── reference-previous/          archival material — read for context, not for execution
+    ├── POSTMORTEM.md            the OOM brick-loop incident; why the hardening exists
     └── drop-ins/                snapshot of what harden-llm-stack.sh writes
                                  to ~/.config/systemd/user/<unit>.d/override.conf
                                  (live files — this is just a reference copy)
@@ -153,7 +154,7 @@ A slot lives in four files that must stay in sync. Change one, change all:
 - **Single-slot rule** (the one that bricks the box if ignored):
   Running more than one heavyweight slot at a time exhausts 128 GB
   unified memory and triggers an OOM respawn loop documented in
-  [POSTMORTEM.md](POSTMORTEM.md). `docker-llm-switch` enforces this by
+  [POSTMORTEM.md](reference-previous/POSTMORTEM.md). `docker-llm-switch` enforces this by
   stopping every other `spark-llm-*` container before starting a new one
   — so use `./docker/run.sh <slot>` or `docker-llm-switch <slot>`, never
   raw `docker run`.
@@ -217,6 +218,16 @@ through the Manager web UI or by `git clone`-ing into
 up. Workflows / settings live in `~/comfyui/user/`, generated images in
 `~/comfyui/output/`.
 
+### Verifying a build before you trust it
+
+CI runs Dockerfile lint + a Scout base-image CVE scan, but it has no
+GPU and cannot exercise the actual binaries. See
+[`docker/SMOKE-TESTS.md`](docker/SMOKE-TESTS.md) for the manual checklist
+that has to pass on a real GB10 host before changes under `docker/` are
+considered shippable (build, bad-ref regression, mutual exclusion,
+Tailscale reachability, hardening parity, end-to-end FLUX gen, custom-
+node persistence, daemon-restart survival).
+
 First-time HF download example (one-off, fills `~/models/`):
 
 ```bash
@@ -245,13 +256,44 @@ A vLLM container for the same GB10 hardware that confirmed the right approach be
 
 That repo does not use Tailscale — it relies on InfiniBand/RoCE for multi-node links. This confirmed that host networking (`--network=host`) is the right and sufficient approach for single-node Tailscale access.
 
-### From this repo's own `.service` files and `POSTMORTEM.md`
+### From this repo's own `.service` files and [`POSTMORTEM.md`](reference-previous/POSTMORTEM.md)
 Every llama.cpp flag, env var, and memory limit came from what was already here:
 - **GB10 cmake flags** (`121a-real`, `GGML_CPU_KLEIDIAI`, `GGML_CUDA_FA_ALL_QUANTS`, `GGML_CUDA_FORCE_MMQ`) — copied verbatim from the README build section.
 - **`CMD` args** in the Dockerfile and `docker-llm-switch` slot tables — translated line-for-line from the `ExecStart` blocks in each `.service` file (`qwen27-mtp.service`, `qwen35-mtp.service`, `gemma-31b.service`, `gemma-vision.service`, `gptoss-20b.service`).
 - **CUDA env vars** (`CUDA_SCALE_LAUNCH_QUEUES=4x`, `GGML_CUDA_GRAPH_OPT=1`, `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1`) — lifted from the `Environment=` lines in every service unit.
 - **Memory caps** — `docker-llm-switch`'s `MEMCAP` and `MEMSOFT` tables map directly to the `MemoryMax` and `MemoryHigh` drop-in values from the POSTMORTEM hardening table. `--rm` (runtime) gives `OOMPolicy=stop` semantics; `--oom-score-adj=200` mirrors `OOMScoreAdjust=200`; `--restart unless-stopped` (boot-default) is the Docker analogue of `WantedBy=default.target`; `stop_all_except` replaces `Conflicts=`.
 - **`--host 0.0.0.0`** (not `127.0.0.1`) — the one deliberate delta from the service files, needed so traffic arriving on the host's `tailscale0` interface reaches the server.
+
+## ComfyUI + FLUX containers — what came from where
+
+`docker/comfyui/` and `docker/sd-server/` were synthesised from this repo's own systemd units (the `ExecStart` for `flux-klein.service` is the authoritative source for the sd-server CMD), plus the following community work on Blackwell aarch64 — none of their images are pulled directly, but their configuration choices are the reason the build works on first try.
+
+### From [AEON-7/comfyui-aeon-spark](https://github.com/AEON-7/comfyui-aeon-spark)
+The most concrete reference for Blackwell-specific tuning:
+- **`TORCH_CUDA_ARCH_LIST=12.1a`** — emit sm_121a SASS specifically, not generic Blackwell PTX. Adopted in `docker/comfyui/Dockerfile`.
+- **SageAttention compile flags** (`-gencode=arch=compute_121a,code=sm_121a` via `NVCC_APPEND_FLAGS`) — the only working fast-attention path on GB10; FlashAttention 2/3 has no aarch64 sm_121 wheels. Used verbatim in the SageAttention build step.
+- **`TORCH_COMPILE_DISABLE=1`** — torch.compile emits broken SASS for sm_121a on PyTorch 2.9.x. Set as ENV in both build and runtime stages.
+- **`CUDA_MANAGED_FORCE_DEVICE_ALLOC=1` + `PYTORCH_ALLOC_CONF=expandable_segments:True`** — Grace unified-memory tuning; lifted from their docker-compose env block.
+- **`--disable-pinned-memory --reserve-vram 2.0`** ComfyUI CLI flags — community-confirmed workaround for the Grace coherence issues. Applied as the default CMD.
+
+### From [luix93/DGX-Spark-ComfyUI](https://github.com/luix93/DGX-Spark-ComfyUI)
+- **`/opt/venv` virtualenv pattern** — copy a fully-resolved venv from the builder stage rather than running pip in the runtime stage. Cleaner final image; adopted.
+- **PyTorch source**: official cu130 wheels from `https://download.pytorch.org/whl/cu130`, NOT NGC wheels (NGC lags in sm_121a PTX). Locked to `torch==2.9.1+cu130` in `docker/comfyui/Dockerfile`.
+
+### From [mmartial/ComfyUI-Nvidia-Docker](https://github.com/mmartial/ComfyUI-Nvidia-Docker)
+- **ComfyUI-Manager auto-bootstrap pattern** — bake a default copy of ComfyUI-Manager into the image at a path *outside* the bind-mount target (`/opt/comfy-defaults/`), seeded into `/opt/ComfyUI/custom_nodes/` on first run via a small entrypoint script. Without this, a bind-mounted empty host directory shadows the in-image ComfyUI-Manager and the user has to install it by hand. See `docker/comfyui/entrypoint.sh`.
+- **`HF_HUB_ENABLE_HF_TRANSFER=1`** — faster model downloads when grabbing weights from inside the container.
+
+### From the NVIDIA Developer forums + [comfyanonymous/ComfyUI#11106](https://github.com/comfyanonymous/ComfyUI/issues/11106)
+- **Documented mitigations** for the Grace unified-memory VAE-Decode spike (chained VAE Decode + Depth can spike past 128 GB in seconds). Our defaults match the community workaround; the README "Before you begin" section flags the issue so the user has a pointer when they hit it.
+- **CUDA 13.x is mandatory** for sm_121 support; CUDA 12.x maxes out at sm_120 and won't work. Already baked in via the existing `nvidia/cuda:13.2.0` base image.
+
+### What we deliberately did NOT take
+
+- **Pre-bundled custom-node packs** (AEON-7 ships 14 node repos; luix93 ships several) — we ship only ComfyUI-Manager and let the user install what they actually need via the web UI. Image stays smaller, no version-lock surprises.
+- **Pre-staged model weights** (AEON-7 ships ~285 GB of FLUX/SDXL/LoRA bundles) — models live on the host at `~/models/`, bind-mounted in. Image stays small, weights are not duplicated.
+- **NGC `nvcr.io/nvidia/cuda`** base images — Docker Hub `nvidia/cuda:13.2.0` works the same and matches the existing llama Dockerfile, so layer cache is shared.
+- **`docker-compose` as runtime orchestrator** — we use compose for builds only; runtime (mutual exclusion, boot-default, status, wait_ready) stays in `docker-llm-switch` so the systemd and Docker paths have the same UX.
 
 ---
 
@@ -491,7 +533,7 @@ flux-gen "pixel art sword icon, white background" 512 512 4 42
 
 > **Critical on GB10.** Running multiple heavyweight services simultaneously  
 > exceeds 128 GB and causes a systemd OOM respawn loop that bricks the host.  
-> See [POSTMORTEM.md](POSTMORTEM.md) for the full incident report.
+> See [POSTMORTEM.md](reference-previous/POSTMORTEM.md) for the full incident report.
 
 ### Drop-ins applied by `harden-llm-stack.sh`
 
