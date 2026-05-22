@@ -32,7 +32,12 @@ else
   spark_acquire_lock() { :; }
   spark_admission_check() { return 0; }
   spark_cross_stack_stop_others() { :; }
-  spark_drop_caches() { sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'; }
+  spark_drop_caches() {
+    sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || {
+      echo "autoresearch-switch: drop_caches shim skipped (no passwordless sudo)" >&2
+      return 0
+    }
+  }
   spark_panic_stop_all() {
     echo "spark-panic shim: stopping every spark-* docker container" >&2
     docker ps -q --filter "name=spark-" | xargs -r docker stop -t 10 >/dev/null 2>&1 || true
