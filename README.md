@@ -1,23 +1,25 @@
 # spark-llm-stack
 
-## Docker / container setup
+## Docker container — what came from where
 
-The `Dockerfile`, `run.sh`, and `docker-llm-switch` in this repo were derived from two sources:
-
-### From this repo (spark-llm-stack)
-
-- **CUDA environment variables** — `CUDA_SCALE_LAUNCH_QUEUES=4x`, `GGML_CUDA_GRAPH_OPT=1`, `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1` baked into the runtime image as `ENV` so every container inherits them without per-slot repetition.
-- **llama.cpp build flags** — the exact GB10-specific CMake flags from the [Build section](#build-llamacpp-gb10-specific-flags): `121a-real` native SASS, `GGML_CPU_KLEIDIAI` SVE2 GEMM, `GGML_CUDA_FA_ALL_QUANTS`, `GGML_CUDA_FORCE_MMQ`.
-- **Per-slot CMD arrays** in `docker-llm-switch` — each slot's `docker run` CMD is a verbatim copy of the corresponding `ExecStart` in the `.service` files, with `--host 0.0.0.0` substituted for `127.0.0.1` so Tailscale traffic on `tailscale0` reaches the server.
-- **POSTMORTEM hardening table** — `MemoryMax` and `MemoryHigh` values from the [Drop-ins table](#drop-ins-applied-by-harden-llm-stacksh) become `--memory` and `--memory-reservation` flags. `OOMPolicy=stop` maps to `--rm` for runtime containers and `--restart on-failure:3` for boot-default (deliberately not `unless-stopped`, which would recreate the OOM brick loop). `Conflicts=` mutual exclusion becomes `stop_all_except` before any slot start.
-- **`flux-gen`** — bundled into the container image (`COPY` into `/usr/local/bin`) and parameterized with `${FLUX_HOST:-http://127.0.0.1:8160}` so it can target a remote FLUX server over Tailscale.
+The `Dockerfile`, `run.sh`, and `docker-llm-switch` were built by synthesising three sources:
 
 ### From [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)
+A vLLM container for the same GB10 hardware that confirmed the right approach before a line was written:
+- **Base image**: `nvidia/cuda:13.2.0-devel-ubuntu24.04` — verified by that repo to work on GB10 aarch64; used verbatim.
+- **Multi-stage build** (builder → runtime) — keeps the final image free of cmake, git, and CUDA headers.
+- **`ARG BUILD_JOBS=16`** with `ENV MAX_JOBS=${BUILD_JOBS}` — parallelism override pattern adopted as-is.
+- **Ninja generator** (`-G Ninja`) — that repo builds all its C++ with Ninja; used here for the llama.cpp build.
 
-- **Base image** — `nvidia/cuda:13.2.0-devel-ubuntu24.04`. That repo confirmed this is the right CUDA image for GB10 on aarch64 (later than the README's stated minimum of 13.0).
-- **Multi-stage builder → runtime pattern** — separate `builder` and `runtime` stages so the final image carries only `llama-server`, `llama-bench`, and their runtime libs, not the full CUDA dev toolchain and build tree.
-- **`ARG BUILD_JOBS=16`** — overridable build parallelism, matching the `MAX_JOBS` pattern used in that Dockerfile.
-- **No Tailscale in the container** — that repo uses direct host networking for cluster comms rather than VPN; the same principle applies here. Tailscale is already on the DGX Spark host, so `--network=host` is sufficient — no in-container `tailscaled` needed.
+That repo does not use Tailscale — it relies on InfiniBand/RoCE for multi-node links. This confirmed that host networking (`--network=host`) is the right and sufficient approach for single-node Tailscale access.
+
+### From this repo's own `.service` files and `POSTMORTEM.md`
+Every llama.cpp flag, env var, and memory limit came from what was already here:
+- **GB10 cmake flags** (`121a-real`, `GGML_CPU_KLEIDIAI`, `GGML_CUDA_FA_ALL_QUANTS`, `GGML_CUDA_FORCE_MMQ`) — copied verbatim from the README build section.
+- **`CMD` args** in the Dockerfile and `docker-llm-switch` slot tables — translated line-for-line from the `ExecStart` blocks in each `.service` file (`qwen27-mtp.service`, `qwen35-mtp.service`, `gemma-31b.service`, `gemma-vision.service`, `gptoss-20b.service`).
+- **CUDA env vars** (`CUDA_SCALE_LAUNCH_QUEUES=4x`, `GGML_CUDA_GRAPH_OPT=1`, `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1`) — lifted from the `Environment=` lines in every service unit.
+- **Memory caps** — `docker-llm-switch`'s `MEMCAP` and `MEMSOFT` tables map directly to the `MemoryMax` and `MemoryHigh` drop-in values from the POSTMORTEM hardening table. `--rm` + `--restart on-failure:3` replaces `OOMPolicy=stop` + `StartLimitBurst=3`; `stop_all_except` replaces `Conflicts=`.
+- **`--host 0.0.0.0`** (not `127.0.0.1`) — the one deliberate delta from the service files, needed so traffic arriving on the host's `tailscale0` interface reaches the server.
 
 ---
 
