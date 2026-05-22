@@ -8,8 +8,8 @@ WIDTH="${2:-512}"
 HEIGHT="${3:-512}"
 STEPS="${4:-4}"
 SEED="${5:--1}"
-BASE="http://127.0.0.1:8160"
-OUTDIR=~/flux-output
+BASE="${FLUX_HOST:-http://127.0.0.1:8160}"
+OUTDIR="$HOME/flux-output"
 mkdir -p "$OUTDIR"
 
 # Check server
@@ -21,24 +21,43 @@ curl -sf "$BASE/sdcpp/v1/capabilities" > /dev/null 2>&1 || {
 echo "Generating: $PROMPT"
 echo "Size: ${WIDTH}x${HEIGHT}  Steps: $STEPS  Seed: $SEED"
 
-python3 << PYEOF
-import requests, time, json, base64, os
+# Pass values via argv so prompts containing quotes/newlines aren't interpolated
+# into Python source. Numeric values are parsed and bounds-checked in Python.
+python3 - "$BASE" "$PROMPT" "$WIDTH" "$HEIGHT" "$STEPS" "$SEED" "$OUTDIR" <<'PYEOF'
+import sys, time, base64
+import requests
 
-BASE = "$BASE"
+base, prompt, width_s, height_s, steps_s, seed_s, outdir = sys.argv[1:8]
+
+def parse_int(name, value, lo, hi):
+    try:
+        n = int(value)
+    except ValueError:
+        sys.exit(f"flux-gen: {name} must be an integer, got {value!r}")
+    if not (lo <= n <= hi):
+        sys.exit(f"flux-gen: {name}={n} out of range [{lo}, {hi}]")
+    return n
+
+width  = parse_int("width",  width_s,  64, 4096)
+height = parse_int("height", height_s, 64, 4096)
+steps  = parse_int("steps",  steps_s,   1, 200)
+# seed may be -1 (random) or any non-negative int
+seed   = parse_int("seed",   seed_s,   -1, 2**31 - 1)
+
 payload = {
-    "prompt": "$PROMPT",
-    "width": $WIDTH,
-    "height": $HEIGHT,
+    "prompt": prompt,
+    "width": width,
+    "height": height,
     "batch_count": 1,
-    "seed": $SEED,
+    "seed": seed,
     "sample_params": {
-        "sample_steps": $STEPS,
+        "sample_steps": steps,
         "sample_method": "euler",
-        "guidance": {"txt_cfg": 1.0, "distilled_guidance": 3.5}
-    }
+        "guidance": {"txt_cfg": 1.0, "distilled_guidance": 3.5},
+    },
 }
 
-r = requests.post(f"{BASE}/sdcpp/v1/img_gen", json=payload)
+r = requests.post(f"{base}/sdcpp/v1/img_gen", json=payload)
 job = r.json()
 job_id = job["id"]
 print(f"Job: {job_id}")
@@ -46,7 +65,7 @@ print(f"Job: {job_id}")
 start = time.time()
 while True:
     time.sleep(0.5)
-    r = requests.get(f"{BASE}/sdcpp/v1/jobs/{job_id}")
+    r = requests.get(f"{base}/sdcpp/v1/jobs/{job_id}")
     job = r.json()
     status = job.get("status")
     if status in ("completed", "failed", "cancelled"):
@@ -57,7 +76,7 @@ if status == "completed":
     images = job.get("result", {}).get("images", [])
     if images:
         img = base64.b64decode(images[0]["b64_json"])
-        fname = f"$OUTDIR/flux-{int(time.time())}.png"
+        fname = f"{outdir}/flux-{int(time.time())}.png"
         with open(fname, "wb") as f:
             f.write(img)
         print(f"Done in {elapsed:.1f}s — {fname}  ({len(img)/1024:.0f}KB)")

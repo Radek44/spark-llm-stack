@@ -199,5 +199,5 @@ journalctl --list-boots | tail -10
 journalctl --since '24h ago' -k | grep -iE 'oom|killed process|out of memory'
 
 # Revert all hardening drop-ins
-bash harden-llm-stack.sh --revert
+bash systemd/harden-llm-stack.sh --revert
 ```

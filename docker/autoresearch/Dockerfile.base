@@ -1,0 +1,32 @@
+ARG CUDA_VERSION=13.2.0
+ARG UBUNTU_VERSION=24.04
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_CACHE_DIR=/workspace/.uv-cache
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    python3 \
+    python3-pip \
+    python3-venv \
+    unzip \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH=/root/.local/bin:${PATH}
+
+WORKDIR /workspace
+
+COPY docker/autoresearch/scripts/entrypoint.sh /usr/local/bin/autoresearch-entrypoint
+RUN chmod +x /usr/local/bin/autoresearch-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/autoresearch-entrypoint"]

@@ -1,0 +1,90 @@
+name: docker
+
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+      - "tools/flux-gen"
+      - ".github/workflows/docker.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - "tools/flux-gen"
+      - ".github/workflows/docker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  lint:
+    name: Dockerfile check (${{ matrix.dockerfile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile:
+          - docker/Dockerfile
+          - docker/sd-server/Dockerfile
+          - docker/comfyui/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # BuildKit's `check` frontend lints the Dockerfile (deprecated flags,
+      # unset ARGs, stale base images, etc.) without compiling anything.
+      # No GPU needed — we never build the CUDA stages here.
+      - name: Lint Dockerfile
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          call: check
+
+  scout:
+    name: Scout base-image scan (${{ matrix.dockerfile }})
+    runs-on: ubuntu-latest
+    # Scan only on PRs and main pushes; skip on forks (no token).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile:
+          - docker/Dockerfile
+          - docker/sd-server/Dockerfile
+          - docker/comfyui/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      # Scout can scan an image reference directly — no need to build the
+      # GB10-specific runtime image. All three Dockerfiles expose
+      # ARG CUDA_VERSION / ARG UBUNTU_VERSION and FROM nvidia/cuda:...; the
+      # final-stage runtime base is what we want to scan for CVEs.
+      - name: Resolve base image from Dockerfile
+        id: base
+        run: |
+          cuda=$(awk -F= '/^ARG CUDA_VERSION=/{print $2}' "${{ matrix.dockerfile }}")
+          ubuntu=$(awk -F= '/^ARG UBUNTU_VERSION=/{print $2}' "${{ matrix.dockerfile }}")
+          echo "image=nvidia/cuda:${cuda}-runtime-ubuntu${ubuntu}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker Scout — CVEs (high/critical)
+        uses: docker/scout-action@v1
+        env:
+          # Repo secrets must be exposed to the step env explicitly —
+          # docker/scout-action reads these from the environment, not
+          # from `with:` inputs. Without this block the action falls
+          # back to ambient GitHub credentials and fails with
+          # "user <actor> not entitled to use Docker Scout".
+          DOCKER_SCOUT_HUB_USER: ${{ secrets.DOCKER_SCOUT_HUB_USER }}
+          DOCKER_SCOUT_HUB_PASSWORD: ${{ secrets.DOCKER_SCOUT_HUB_PASSWORD }}
+        with:
+          command: cves
+          image: ${{ steps.base.outputs.image }}
+          only-severities: critical,high
+          exit-code: false
+          summary: true

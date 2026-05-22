@@ -1,0 +1,37 @@
+# Declarative build + per-slot service definitions for the spark-llm-stack
+# Docker path.
+#
+# Build all three images:
+#   docker compose -f docker/docker-compose.yml build
+#
+# Build one image:
+#   docker compose -f docker/docker-compose.yml build comfyui
+#
+# Runtime is handled by docker-llm-switch (mutual exclusion, boot-default,
+# wait_ready), so this file does not enumerate per-slot llama services
+# beyond the build of the shared spark-llm-stack image. The Docker run
+# args (memory caps, --oom-score-adj, --network=host, models bind-mount)
+# live in docker-llm-switch's docker_run_slot helper so there's one
+# source of truth for runtime hardening.
+
+x-build-defaults: &build-defaults
+  context: ..
+
+services:
+  llama:
+    image: spark-llm-stack
+    build:
+      <<: *build-defaults
+      dockerfile: docker/Dockerfile
+
+  imagine:
+    image: spark-llm-imagine
+    build:
+      <<: *build-defaults
+      dockerfile: docker/sd-server/Dockerfile
+
+  comfyui:
+    image: spark-llm-comfyui
+    build:
+      <<: *build-defaults
+      dockerfile: docker/comfyui/Dockerfile
