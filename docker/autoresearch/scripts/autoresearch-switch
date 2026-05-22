@@ -9,6 +9,17 @@ ENV_FILE="$ROOT_DIR/.env.autoresearch"
 
 SERVICES=(karpathy dgx nauto-orch nauto-worker gemini autokernel)
 
+# Source operator-tuned memory caps so projected_cap_gb sees them. Without
+# this the shell only knows the hardcoded fallbacks below, even though
+# `compose --env-file` passes them through to docker — leading admission to
+# under-/over-estimate when .env.autoresearch overrides defaults.
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
 # ── cross-stack failsafe library (docker/lib/spark-mem.sh) ────────────────────
 #
 # Provides: spark_acquire_lock, spark_admission_check,

@@ -97,10 +97,10 @@ spark_acquire_lock() {
     return 1
   fi
   SPARK_LOCK_HELD=1
-  # Defensive: log every exit path so an operator watching journalctl sees
-  # the lock release (the OS releases the flock when the FD closes on exit,
-  # but the log line confirms the script didn't die silently mid-critical-section).
-  trap 'spark_log "lock released ($SPARK_LOCK_PATH)"' EXIT
+  # Note: no EXIT trap installed. This file is sourced by other scripts that
+  # may register their own EXIT traps; installing one here would clobber the
+  # caller's cleanup. The kernel releases the flock automatically when the
+  # process exits / the FD closes, so the trap was only ever cosmetic logging.
   return 0
 }
 

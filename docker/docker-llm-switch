@@ -483,6 +483,16 @@ if is_slot "$CMD"; then
   target=$(ctr_name "$CMD")
   echo "→ $CMD mode (${ROLES[$CMD]})"
 
+  # Idempotency: if the target slot is already running, this is a no-op.
+  # Skip the failsafe block entirely — running drop_caches / admission /
+  # cross_stack_stop_others on an "ensure up" call would evict in-flight
+  # cross-stack workloads despite no new container being started.
+  if [ "$(ctr_state "$target")" = "running" ]; then
+    echo "  already running"
+    show_status
+    exit 0
+  fi
+
   # Layer 1 of the cross-stack failsafe: shared mutex + admission gate.
   spark_acquire_lock || exit 1
 
