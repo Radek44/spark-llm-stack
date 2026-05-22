@@ -17,6 +17,7 @@
 # First-time model download (runs once, writes into ~/models via the volume):
 #   docker run --rm --gpus=all --network=host \
 #     --memory=80g --memory-swap=80g \
+#     --ulimit memlock=-1:-1 --shm-size=1g \
 #     -v ~/models:/models \
 #     -e HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN}" \
 #     spark-llm-stack \
@@ -46,6 +47,8 @@ BASE_ARGS=(
   --network=host
   --memory=80g
   --memory-swap=80g
+  --ulimit memlock=-1:-1
+  --shm-size=1g
   -v "${MODELS_DIR}:/models"
   -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}"
 )

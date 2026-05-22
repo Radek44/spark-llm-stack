@@ -5,10 +5,12 @@
 #   docker build -t spark-llm-stack .
 #   docker build --build-arg BUILD_JOBS=20 -t spark-llm-stack .
 #
-# Override to the pre-merge MTP branch if mainline perf regresses:
-#   docker build \
-#     --build-arg LLAMA_REF=<commit-or-branch> \
-#     -t spark-llm-stack .
+# PERFORMANCE WARNING — LLAMA_REF default:
+#   The default LLAMA_REF=master ships mainline llama.cpp, which currently
+#   underperforms on GB10 (~23 vs ~28 t/s on Qwen3.6-27B). The systemd
+#   *.service files use a pre-merge MTP branch. For full perf:
+#     docker build --build-arg LLAMA_REF=<mtp-commit-or-branch> -t spark-llm-stack .
+#   Pin to a SHA — branch HEADs drift and break reproducibility.
 
 ARG CUDA_VERSION=13.2.0
 ARG UBUNTU_VERSION=24.04
@@ -28,6 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4-openssl-dev \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+
+# CUDA driver compat shim — stock nvidia/cuda images omit /usr/local/cuda-13/compat
+# from LD_LIBRARY_PATH, which holds libcuda.so.1. Without this, the build can
+# fail to link or runtime hits "CUDA driver not found" even with --gpus=all.
+# See: https://forums.developer.nvidia.com/t/building-llama-cpp-container-images-for-spark-gb10/353664
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13/compat:${LD_LIBRARY_PATH}
 
 WORKDIR /build
 RUN git clone --depth 1 --branch ${LLAMA_REF} ${LLAMA_REPO} llama.cpp 2>/dev/null \
@@ -68,6 +76,9 @@ COPY --from=builder /build/llama.cpp/build/bin/llama-bench   /usr/local/bin/llam
 # It's an HTTP client; set FLUX_HOST=http://<addr>:8160 to target a remote server.
 COPY flux-gen /usr/local/bin/flux-gen
 RUN chmod +x /usr/local/bin/flux-gen
+
+# CUDA driver compat shim — see builder stage for rationale.
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13/compat:${LD_LIBRARY_PATH}
 
 # GB10 performance tuning (from qwen27-mtp.service and qwen35-mtp.service)
 ENV CUDA_SCALE_LAUNCH_QUEUES=4x

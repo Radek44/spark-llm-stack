@@ -193,6 +193,8 @@ run_slot() {
     --gpus=all --network=host \
     --memory="$mem" --memory-swap="$mem" \
     --memory-reservation="$memsoft" \
+    --ulimit memlock=-1:-1 \
+    --shm-size=1g \
     -v "${MODELS_DIR}:/models" \
     -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}" \
     "${IMAGE}" \
@@ -257,6 +259,8 @@ boot_default() {
             --gpus=all --network=host \
             --memory="$mem" --memory-swap="$mem" \
             --memory-reservation="$memsoft" \
+            --ulimit memlock=-1:-1 \
+            --shm-size=1g \
             -v "${MODELS_DIR}:/models" \
             -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}" \
             "${IMAGE}" \
