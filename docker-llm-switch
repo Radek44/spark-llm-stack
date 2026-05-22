@@ -199,7 +199,7 @@ wait_ready() {
 }
 
 # Shared `docker run` for a slot. Caller passes lifecycle flags as
-# extra args (e.g. `--rm` for runtime, `--restart on-failure:3` for boot-default).
+# extra args (e.g. `--rm` for runtime, `--restart unless-stopped` for boot-default).
 docker_run_slot() {
   local slot="$1"; shift
   local name; name=$(ctr_name "$slot")
@@ -245,8 +245,8 @@ show_status() {
     state=$(ctr_state "$name")
     boot=$(ctr_restart_policy "$name")
     case "$boot" in
-      on-failure)  boot="enabled" ;;
-      ""|no)       boot="disabled" ;;
+      unless-stopped)  boot="enabled" ;;
+      ""|no)           boot="disabled" ;;
     esac
     [ "$state" = "absent" ] && boot="-"
     printf "  %-10s %-22s %-10s %-9s %s\n" \
@@ -278,8 +278,9 @@ boot_default() {
   fi
   local keep; keep=$(ctr_name "$slot")
   echo "→ setting $slot as Docker boot-default (stops + clears restart policy on others)"
-  echo "  using --restart on-failure:3 (matches StartLimitBurst=3 + OOMPolicy=stop"
-  echo "  from POSTMORTEM hardening — prevents OOM respawn brick loop)"
+  echo "  using --restart unless-stopped so the slot auto-starts on Docker daemon"
+  echo "  reboot. POSTMORTEM brick-loop protection still holds: mutual exclusion is"
+  echo "  enforced by stop_all_except, and only this one slot carries a restart policy."
 
   stop_all_except "$keep"
 
@@ -289,26 +290,20 @@ boot_default() {
       case "$(ctr_state "$name")" in
         absent|exited)
           [ "$(ctr_state "$name")" = "exited" ] && ensure_absent "$name"
-          docker_run_slot "$slot" --restart on-failure:3
-          echo "  $s: created with --restart on-failure:3"
+          docker_run_slot "$slot" --restart unless-stopped
+          echo "  $s: created with --restart unless-stopped"
           ;;
         running)
-          # Three cases:
-          # 1. Already configured (non-rm, on-failure:3) → no-op, idempotent.
-          # 2. Non-rm but wrong policy → `docker update` in place, no downtime.
-          # 3. Started with --rm (by run_slot) → `docker update` would fail;
-          #    must stop and recreate without --rm.
           if [ "$(ctr_autoremove "$name")" = "true" ]; then
-            echo "  $s: running with --rm; recreating with --restart on-failure:3"
+            echo "  $s: running with --rm; recreating with --restart unless-stopped"
             docker stop "$name" >/dev/null
             ensure_absent "$name"
-            docker_run_slot "$slot" --restart on-failure:3
-          elif [ "$(ctr_restart_policy "$name")" = "on-failure" ] \
-               && [ "$(ctr_restart_max "$name")" = "3" ]; then
-            echo "  $s: already configured (on-failure:3), no change"
+            docker_run_slot "$slot" --restart unless-stopped
+          elif [ "$(ctr_restart_policy "$name")" = "unless-stopped" ]; then
+            echo "  $s: already configured (unless-stopped), no change"
           else
-            docker update --restart on-failure:3 "$name" >/dev/null
-            echo "  $s: restart policy updated → on-failure:3 (no restart)"
+            docker update --restart unless-stopped "$name" >/dev/null
+            echo "  $s: restart policy updated → unless-stopped (no downtime)"
           fi
           ;;
       esac
@@ -327,7 +322,7 @@ boot_status() {
   local any=0
   for slot in "${SLOTS[@]}"; do
     local name; name=$(ctr_name "$slot")
-    if [ "$(ctr_restart_policy "$name")" = "on-failure" ]; then
+    if [ "$(ctr_restart_policy "$name")" = "unless-stopped" ]; then
       printf "  auto-start at Docker boot: %s (%s)\n" "$slot" "$name"
       any=1
     fi
@@ -392,7 +387,7 @@ Runtime:
 Boot (Docker daemon restart policy):
   docker-llm-switch boot-safe       clear --restart on all slots
   docker-llm-switch boot-default <slot>
-                                    set ONE slot to --restart on-failure:3
+                                    set ONE slot to --restart unless-stopped
   docker-llm-switch boot-status     show what auto-starts at Docker boot
 
 Slots: ${SLOTS[*]}
