@@ -187,8 +187,8 @@ starting point.
 4.9× KV cache compression unlocks ~536K context on this hardware. But
 the research itself flags MTP-branch stability of `turbo3` as unclear
 (see `findings_turboquant.md` and `findings_llama_cpp.md` in `docs/research/`).
-At our current `-c 262144` with `q8_0/q8_0` we're not memory-pressured
-on the KV cache. Revisit if a use case actually needs >256K context, or
+At our current `-c 131072` with `q8_0/q8_0` we're not memory-pressured
+on the KV cache. Revisit if a use case actually needs >128K context, or
 the MTP+turbo3 combo gets community validation.
 
 ## 15. GPU clock-lock as an ops step, not a container concern
