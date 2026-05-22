@@ -1,8 +1,211 @@
 # spark-llm-stack
 
+Local LLM inference stack for **NVIDIA DGX Spark (GB10 Grace Blackwell)**.
+Two deployment paths over the same model roster — systemd user-services
+(primary) and Docker containers (mirror) — bound by a shared hardening
+contract that prevents the 128 GB unified-memory OOM brick-loop documented
+in [POSTMORTEM.md](POSTMORTEM.md).
+
+## Repo structure
+
+```
+spark-llm-stack/
+├── README.md                    ← you are here
+├── CLAUDE.md                    contributor / agent guide
+├── POSTMORTEM.md                the OOM brick-loop incident; why hardening exists
+│
+├── systemd/                     PRIMARY path: user-services on the host
+│   ├── units/                     one .service per model slot (authoritative ExecStart)
+│   │   ├── qwen27-mtp.service     coder       :8152
+│   │   ├── qwen35-mtp.service     architect   :8154
+│   │   ├── gemma-vision.service   vision      :8155
+│   │   ├── gemma-31b.service      gemma       :8156
+│   │   ├── gptoss-20b.service     gptoss      :8157
+│   │   └── flux-klein.service     imagine     :8160 (sd-server / FLUX.2-klein)
+│   ├── llm-switch                runtime slot manager (stop others, start one, wait_ready)
+│   └── harden-llm-stack.sh       generates drop-ins: MemoryMax, OOMPolicy=stop,
+│                                 Conflicts=, StartLimitBurst=3 — this is the
+│                                 contract POSTMORTEM mandates
+│
+├── docker/                      MIRROR path: same slots, in containers
+│   ├── Dockerfile                multi-stage CUDA 13.2 + llama.cpp build
+│   ├── docker-llm-switch         Docker analogue of systemd llm-switch
+│   │                             (stop_all_except → Conflicts=,
+│   │                              --rm → OOMPolicy=stop,
+│   │                              --oom-score-adj=200 → OOMScoreAdjust=200,
+│   │                              --restart unless-stopped → boot-default)
+│   └── run.sh                    thin wrapper: delegates to docker-llm-switch
+│
+├── tools/
+│   └── flux-gen                 CLI for the FLUX.2-klein async image API
+│                                (bundled inside the Docker image too)
+│
+├── config/
+│   └── hermes-config-snippet.yaml   provider stanzas for the Hermes harness
+│
+└── reference-previous/
+    └── drop-ins/                snapshot of what harden-llm-stack.sh writes
+                                 to ~/.config/systemd/user/<unit>.d/override.conf
+                                 (live files — this is just a reference copy)
+```
+
+## How everything wires together
+
+```
+                      ┌───────────────────────────────────────────┐
+                      │  Authoritative arg set lives in:          │
+                      │    systemd/units/<slot>.service ExecStart │
+                      └───────────────────────────────────────────┘
+                            │                            │
+                  mirror    │                            │  mirror
+                  (live)    ▼                            ▼  (in image)
+       ┌────────────────────────────┐      ┌────────────────────────────────┐
+       │ systemd/llm-switch         │      │ docker/docker-llm-switch       │
+       │  SVCS[], PORTS[], ROLES[]  │      │  CMD_<slot>[] arrays mirror    │
+       │  wait_ready /health        │      │  ExecStart + --host 0.0.0.0    │
+       └─────────────┬──────────────┘      └────────────────┬───────────────┘
+                     │                                      │
+            starts/stops                            starts/stops
+            ~/.config/systemd/                      spark-llm-<slot>
+            user/<slot>.service                     containers
+                     │                                      │
+                     ▼                                      ▼
+       ┌────────────────────────────┐      ┌────────────────────────────────┐
+       │ llama-server (MTP build)   │      │ llama-server (in container)    │
+       │ listens on :<slot port>    │      │ --network=host, same :port     │
+       └────────────────────────────┘      └────────────────────────────────┘
+                     ▲                                      ▲
+                     └───────── shared hardening ───────────┘
+                                       │
+                  ┌────────────────────┴────────────────────┐
+                  │ systemd/harden-llm-stack.sh writes:     │
+                  │   MemoryMax, OOMPolicy=stop,            │
+                  │   OOMScoreAdjust=200, Conflicts=,       │
+                  │   StartLimitBurst=3                     │
+                  │                                         │
+                  │ Docker path replays the same intent:    │
+                  │   --memory, --rm, --oom-score-adj=200,  │
+                  │   stop_all_except, (no daemon analogue  │
+                  │   to StartLimitBurst — single-slot OOM  │
+                  │   loop is recoverable, multi-slot is    │
+                  │   prevented by stop_all_except)         │
+                  └─────────────────────────────────────────┘
+
+  Clients (Hermes, Claude Code, curl, flux-gen)
+       │
+       │  HTTP over tailscale0 / loopback to :8152/:8154/:8155/:8156/:8157/:8160
+       ▼
+  whichever slot is currently up
+```
+
+### Adding or changing a slot (the four-place rule)
+A slot lives in four files that must stay in sync. Change one, change all:
+
+| File | What to update |
+|---|---|
+| `systemd/units/<slot>.service` | `ExecStart` — authoritative arg set |
+| `systemd/llm-switch` | `SVCS[]`, `PORTS[]`, `ROLES[]` + wait_ready entry |
+| `docker/docker-llm-switch` | `CMD_<slot>[]` + `PORTS`/`ROLES`/`MEMCAP`/`MEMSOFT` |
+| `systemd/harden-llm-stack.sh` | `SERVICES=()` entry with `MemoryHigh/Max` and heavyweight flag |
+
+### What lives where, at runtime
+
+| Concern | Systemd path | Docker path |
+|---|---|---|
+| Mutual exclusion | `Conflicts=` (drop-in) | `stop_all_except` (function) |
+| Memory cap | `MemoryMax=80G` (drop-in) | `--memory=80g --memory-swap=80g` |
+| OOM = halt, not respawn | `OOMPolicy=stop` (drop-in) | `--rm` (runtime mode) |
+| OOM victim selection | `OOMScoreAdjust=200` | `--oom-score-adj=200` |
+| Boot-time auto-start | `systemctl --user enable <slot>` | `--restart unless-stopped` |
+| Respawn burst limit | `StartLimitBurst=3` | (none; relies on mutual exclusion) |
+| `imagine` / `comfyui` | `flux-klein.service`, host ComfyUI | not in scope — out-of-stack images |
+
+---
+
+## Docker quickstart
+
+### Before you begin (read this — it'll save you a brick)
+
+- **Hardware**: NVIDIA DGX Spark GB10 (Grace Blackwell, aarch64, SM 12.1).
+  The cmake flag `121a-real` and the env vars `CUDA_SCALE_LAUNCH_QUEUES=4x`
+  / `GGML_CUDA_GRAPH_OPT=1` only apply on this chip. Other CUDA cards will
+  build but won't get the tuned SASS path.
+- **Driver**: NVIDIA driver 580 or newer, CUDA 13.0+.
+- **Docker**: with the NVIDIA Container Toolkit installed and tested
+  (`docker run --rm --gpus=all nvidia/cuda:13.2.0-base-ubuntu24.04
+  nvidia-smi`).
+- **Disk**: ~20 GB for the image, plus model weights (≈80 GB across the
+  full roster — Qwen3.6-27B alone is ~17 GB).
+- **Models directory**: create `~/models/` and put your GGUFs there. The
+  container bind-mounts it at `/models`. To download weights inside the
+  container, export `HUGGING_FACE_HUB_TOKEN` first.
+- **Network**: containers run `--network=host`. Slots bind to `0.0.0.0`
+  on `:8152` / `:8154` / `:8155` / `:8156` / `:8157` / `:8160` — accessible
+  over Tailscale on the host's `tailscale0` IP. Make sure nothing else
+  on the host is squatting those ports.
+- **Single-slot rule** (the one that bricks the box if ignored):
+  Running more than one heavyweight slot at a time exhausts 128 GB
+  unified memory and triggers an OOM respawn loop documented in
+  [POSTMORTEM.md](POSTMORTEM.md). `docker-llm-switch` enforces this by
+  stopping every other `spark-llm-*` container before starting a new one
+  — so use `./docker/run.sh <slot>` or `docker-llm-switch <slot>`, never
+  raw `docker run`.
+- **Build time**: ~25–40 min on GB10 with `BUILD_JOBS=16`. The default
+  `LLAMA_REF=master` ships mainline llama.cpp (~23 t/s on Qwen3.6-27B).
+  For full perf (~28 t/s), build with `--build-arg LLAMA_REF=<mtp-sha>`
+  pointing at the pre-merge MTP branch the systemd `*.service` files use.
+- **What's not in the Docker path**: the `imagine` (FLUX.2-klein) and
+  `comfyui` slots need separate images (stable-diffusion.cpp and ComfyUI
+  respectively). Use the systemd path for those.
+
+### Commands
+
+Run these from the repo root.
+
+```bash
+# 1. Build the image (build context is the repo root so tools/flux-gen
+#    is reachable; --build-arg LLAMA_REF lets you pin the MTP branch).
+docker build -f docker/Dockerfile -t spark-llm-stack .
+
+# 2. Install the container manager on PATH (one-time).
+cp docker/docker-llm-switch ~/.local/bin/
+chmod +x ~/.local/bin/docker-llm-switch
+
+# 3. Start a slot (stops every other spark-llm-* container first).
+./docker/run.sh                  # coder slot (Qwen3.6-27B, :8152)
+./docker/run.sh architect        # architect slot (Qwen3.6-35B, :8154)
+./docker/run.sh gemma            # gemma 31B, :8156
+./docker/run.sh vision           # gemma vision, :8155
+./docker/run.sh gptoss           # gpt-oss-20B, :8157
+
+# 4. Manage state
+docker-llm-switch status         # what's running, ports, restart policy
+docker-llm-switch off            # stop everything
+
+# 5. Auto-start a slot on Docker daemon reboot
+docker-llm-switch boot-default architect   # only one slot ever has a policy
+docker-llm-switch boot-status              # show what'll start at daemon boot
+docker-llm-switch boot-safe                # clear all restart policies
+```
+
+First-time HF download example (one-off, fills `~/models/`):
+
+```bash
+docker run --rm --gpus=all --network=host \
+  --memory=80g --memory-swap=80g \
+  --oom-score-adj=200 --ulimit memlock=-1:-1 --shm-size=1g \
+  -v ~/models:/models \
+  -e HUGGING_FACE_HUB_TOKEN="$HUGGING_FACE_HUB_TOKEN" \
+  spark-llm-stack \
+  -hf unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
+  --alias qwen3.6-27b-coder --host 0.0.0.0 --port 8152
+```
+
+---
+
 ## Docker container — what came from where
 
-The `Dockerfile`, `run.sh`, and `docker-llm-switch` were built by synthesising three sources:
+The `docker/Dockerfile`, `docker/run.sh`, and `docker/docker-llm-switch` were built by synthesising three sources:
 
 ### From [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)
 A vLLM container for the same GB10 hardware that confirmed the right approach before a line was written:
@@ -169,13 +372,13 @@ You only need to adjust two things:
 ```bash
 # Install service files
 mkdir -p ~/.config/systemd/user
-cp *.service ~/.config/systemd/user/
+cp systemd/units/*.service ~/.config/systemd/user/
 
 # Install drop-ins (memory caps + mutual exclusion) — recommended
-bash harden-llm-stack.sh
+bash systemd/harden-llm-stack.sh
 
-# Or manually:
-for d in drop-ins/*/; do
+# Or manually, copying the reference overlay:
+for d in reference-previous/drop-ins/*/; do
   svc=$(basename "$d")
   mkdir -p ~/.config/systemd/user/$svc
   cp "$d/override.conf" ~/.config/systemd/user/$svc/
@@ -184,8 +387,11 @@ done
 systemctl --user daemon-reload
 
 # Install CLI tools
-cp llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/llm-switch
-cp flux-gen ~/.local/bin/ && chmod +x ~/.local/bin/flux-gen
+cp systemd/llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/llm-switch
+cp tools/flux-gen ~/.local/bin/ && chmod +x ~/.local/bin/flux-gen
+
+# (Optional) Docker path — install the container manager
+cp docker/docker-llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/docker-llm-switch
 ```
 
 ---
@@ -218,7 +424,7 @@ llm-switch boot-status              # check what starts at boot
 ## Harness
 
 [Hermes](https://github.com/nousresearch/hermes-agent) (NousResearch) as agentic harness.  
-Provider config: `hermes-config-snippet.yaml`.
+Provider config: `config/hermes-config-snippet.yaml`.
 
 Key Hermes settings for local providers:
 - `extra_body.max_tokens: 4096` — prevents response cutoff on long codegen
@@ -274,8 +480,8 @@ Each service gets:
 | flux-klein | 12G | 16G |
 
 ```bash
-bash harden-llm-stack.sh          # apply
-bash harden-llm-stack.sh --revert # remove all drop-ins
+bash systemd/harden-llm-stack.sh          # apply
+bash systemd/harden-llm-stack.sh --revert # remove all drop-ins
 ```
 
 ### Flag notes

@@ -43,7 +43,7 @@ SWITCH="${DOCKER_LLM_SWITCH:-docker-llm-switch}"
 
 if ! command -v "$SWITCH" >/dev/null 2>&1; then
   echo "error: '$SWITCH' not found on PATH" >&2
-  echo "install it: cp docker-llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/docker-llm-switch" >&2
+  echo "install it: cp docker/docker-llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/docker-llm-switch" >&2
   exit 1
 fi
 
