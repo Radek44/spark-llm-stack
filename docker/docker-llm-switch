@@ -15,8 +15,10 @@
 # Mutual exclusion: starting a slot stops every other spark-llm-* container first,
 # mirroring the systemd Conflicts= drop-ins from the POSTMORTEM hardening.
 #
-# Not covered here: imagine (FLUX) and comfyui — those need separate images
-# (stable-diffusion.cpp and ComfyUI respectively, not built into spark-llm-stack).
+# Slot coverage: all seven slots are managed here — five llama.cpp slots
+# (coder/architect/gemma/vision/gptoss) share the spark-llm-stack image, plus
+# imagine (FLUX via spark-llm-imagine, built from docker/sd-server) and
+# comfyui (spark-llm-comfyui, built from docker/comfyui).
 
 set -euo pipefail
 
@@ -66,7 +68,7 @@ declare -A IMAGE=(
 CMD_coder=(
   -m /models/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf
   --alias qwen3.6-27b-coder
-  --host 0.0.0.0 --port 8152
+  --host 0.0.0.0 --port "${PORTS[coder]}"
   -ngl 999 -fa on -c 262144
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
@@ -84,7 +86,7 @@ CMD_coder=(
 CMD_architect=(
   -m /models/Qwen3.6-35B-A3B-MTP-Q4_K_XL.gguf
   --alias qwen3.6-35b-architect
-  --host 0.0.0.0 --port 8154
+  --host 0.0.0.0 --port "${PORTS[architect]}"
   -ngl 999 -fa on -c 262144
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
@@ -102,7 +104,7 @@ CMD_architect=(
 CMD_gemma=(
   -m /models/gemma-4-31B-it-UD-Q4_K_XL.gguf
   --alias gemma4-31b
-  --host 0.0.0.0 --port 8156
+  --host 0.0.0.0 --port "${PORTS[gemma]}"
   -ngl 999 -fa on -c 262144
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
@@ -120,7 +122,7 @@ CMD_gemma=(
 CMD_vision=(
   -m /models/gemma-4-E4B-it-UD-Q4_K_XL.gguf
   --alias gemma4-vision
-  --host 0.0.0.0 --port 8155
+  --host 0.0.0.0 --port "${PORTS[vision]}"
   -ngl 999 -fa on -c 131072
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 8192 --cache-reuse 256
@@ -136,7 +138,7 @@ CMD_vision=(
 CMD_gptoss=(
   --gpt-oss-20b-default
   --alias gpt-oss-20b
-  --host 0.0.0.0 --port 8157
+  --host 0.0.0.0 --port "${PORTS[gptoss]}"
   -ngl 999 -fa on -c 131072
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 16384 --cache-idle-slots --cache-reuse 512
@@ -156,7 +158,7 @@ CMD_imagine=(
   --llm /models/flux2-klein/text_encoder/qwen_3_4b.safetensors
   --vae /models/flux2-klein/ae.safetensors
   --listen-ip 0.0.0.0
-  --listen-port 8160
+  --listen-port "${PORTS[imagine]}"
   --diffusion-fa
   --type f16
   --threads 8
@@ -166,7 +168,7 @@ CMD_imagine=(
 # safety flags (see docker/comfyui/Dockerfile for the full rationale).
 CMD_comfyui=(
   --listen 0.0.0.0
-  --port 8188
+  --port "${PORTS[comfyui]}"
   --disable-pinned-memory
   --reserve-vram 2.0
 )
@@ -199,12 +201,17 @@ ctr_autoremove() {
 # settle, so a subsequent `docker run --name "$name"` can't race the cleanup.
 ensure_absent() {
   local name="$1"
+  local waited=0
   docker rm -f "$name" >/dev/null 2>&1 || true
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     [ "$(ctr_state "$name")" = "absent" ] && return 0
     sleep 0.5
+    waited=$((waited + 1))
   done
-  return 0
+  # Hard fail: a later `docker run --name "$name"` would otherwise race the
+  # async auto-remove and emit a nondeterministic name-conflict error.
+  echo "ensure_absent: container '$name' still present after ${waited}x0.5s wait" >&2
+  return 1
 }
 
 stop_all_except() {
@@ -298,11 +305,24 @@ docker_run_slot() {
 run_slot() {
   local slot="$1"
   local name; name=$(ctr_name "$slot")
+  local state; state=$(ctr_state "$name")
+
+  # Preserve a previously configured boot-default: if a stopped container
+  # already exists with `--restart unless-stopped`, start it in place rather
+  # than recreating it with `--rm`, which would silently drop the auto-start
+  # policy and desync `boot-status`.
+  if [ "$state" = "exited" ] \
+     && [ "$(ctr_restart_policy "$name")" = "unless-stopped" ] \
+     && [ "$(ctr_autoremove "$name")" != "true" ]; then
+    echo "  $slot: starting existing boot-default container (restart=unless-stopped preserved)"
+    docker start "$name" >/dev/null
+    return 0
+  fi
 
   # If an old container exists with the same name (or auto-remove is mid-flight),
   # clear it before `docker run --name` races the cleanup.
-  if [ "$(ctr_state "$name")" != "absent" ]; then
-    ensure_absent "$name"
+  if [ "$state" != "absent" ]; then
+    ensure_absent "$name" || exit 1
   fi
 
   # Runtime mode: --rm so an OOM-killed container is removed, not respawned
@@ -312,8 +332,8 @@ run_slot() {
 
 show_status() {
   echo ""
-  printf "  %-10s %-22s %-10s %-9s %s\n" "slot" "container" "state" "at-boot" "role"
-  printf "  %-10s %-22s %-10s %-9s %s\n" "──────────" "────────────────────" "─────────" "─────────" "──────────────────────────"
+  printf "  %-10s %-30s %-10s %-9s %s\n" "slot" "container" "state" "at-boot" "role"
+  printf "  %-10s %-30s %-10s %-9s %s\n" "──────────" "──────────────────────────────" "─────────" "─────────" "──────────────────────────"
   for slot in "${SLOTS[@]}"; do
     local name; name=$(ctr_name "$slot")
     local port="${PORTS[$slot]}"
@@ -325,7 +345,7 @@ show_status() {
       ""|no)           boot="disabled" ;;
     esac
     [ "$state" = "absent" ] && boot="-"
-    printf "  %-10s %-22s %-10s %-9s %s\n" \
+    printf "  %-10s %-30s %-10s %-9s %s\n" \
       "$slot" "$name (:$port)" "$state" "$boot" "${ROLES[$slot]}"
   done
   echo ""
@@ -365,7 +385,7 @@ boot_default() {
     if [ "$name" = "$keep" ]; then
       case "$(ctr_state "$name")" in
         absent|exited)
-          [ "$(ctr_state "$name")" = "exited" ] && ensure_absent "$name"
+          [ "$(ctr_state "$name")" = "exited" ] && { ensure_absent "$name" || exit 1; }
           docker_run_slot "$slot" --restart unless-stopped
           echo "  $s: created with --restart unless-stopped"
           ;;
@@ -373,7 +393,7 @@ boot_default() {
           if [ "$(ctr_autoremove "$name")" = "true" ]; then
             echo "  $s: running with --rm; recreating with --restart unless-stopped"
             docker stop "$name" >/dev/null
-            ensure_absent "$name"
+            ensure_absent "$name" || exit 1
             docker_run_slot "$slot" --restart unless-stopped
           elif [ "$(ctr_restart_policy "$name")" = "unless-stopped" ]; then
             echo "  $s: already configured (unless-stopped), no change"
@@ -413,19 +433,27 @@ boot_status() {
 
 CMD="${1:-status}"
 
+is_slot() {
+  local needle="$1" s
+  for s in "${SLOTS[@]}"; do [ "$s" = "$needle" ] && return 0; done
+  return 1
+}
+
+if is_slot "$CMD"; then
+  target=$(ctr_name "$CMD")
+  echo "→ $CMD mode (${ROLES[$CMD]})"
+  stop_all_except "$target"
+  if [ "$(ctr_state "$target")" = "running" ]; then
+    echo "  already running"
+  else
+    run_slot "$CMD"
+    wait_ready "$CMD"
+  fi
+  show_status
+  exit 0
+fi
+
 case "$CMD" in
-  coder|architect|gemma|vision|gptoss|imagine|comfyui)
-    target=$(ctr_name "$CMD")
-    echo "→ $CMD mode (${ROLES[$CMD]})"
-    stop_all_except "$target"
-    if [ "$(ctr_state "$target")" = "running" ]; then
-      echo "  already running"
-    else
-      run_slot "$CMD"
-      wait_ready "$CMD"
-    fi
-    show_status
-    ;;
   off)
     echo "→ stopping all spark-llm-* containers"
     for slot in "${SLOTS[@]}"; do
