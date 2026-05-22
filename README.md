@@ -649,7 +649,65 @@ bash systemd/harden-llm-stack.sh --revert # remove all drop-ins
 |---|---|---|
 | `--no-mmap` | **removed** | Anonymous pages can't be evicted on unified memory. Page cache is safer. |
 | `--mlock` | **removed** | Pins entire model permanently, starves other services. |
-| `-c 131072` | **default** (128K) | Lowered from 262144 (256K). Halves KV cache footprint; unlocks `--parallel 2` headroom within the 80 G MemoryMax. To bump a specific slot back to 256K, edit `-c 131072` in both `systemd/units/<slot>.service` and the matching `CMD_<slot>` in `docker/docker-llm-switch`, then `systemctl --user daemon-reload` (or rebuild the image). See [`docs/architecture/DECISIONS.md`](docs/architecture/DECISIONS.md) §11. |
+| `-c 131072` | **default** (128K) | Lowered from 262144 (256K) to halve KV-cache footprint. See "Tuning context + concurrency" below for how to bump back. |
+| `--parallel 1` | **default** | Memory-safe at 128K context (`--parallel 2` would fit, but doubles concurrent KV slots). See "Tuning context + concurrency" below. |
+
+### Tuning context + concurrency
+
+The defaults assume one heavy slot, one user at a time, ≤128K tokens of
+context. Two knobs commonly want tuning. Each lives in two mirrored
+files per slot — change both, then reload.
+
+Each slot has its values mirrored in two files: a per-slot
+`systemd/units/<slot>.service` (`sed` is safe here) AND a shared
+`docker/docker-llm-switch` with **one `CMD_<slot>=( ... )` block per
+slot** (manual edit — every block contains the same `-c 131072` /
+`--parallel 1`, so a blind `sed -i` would flip all five).
+
+| Slot | systemd unit | docker-llm-switch block |
+|---|---|---|
+| coder | `systemd/units/qwen27-mtp.service` | `CMD_coder=(...)` |
+| architect | `systemd/units/qwen35-mtp.service` | `CMD_architect=(...)` |
+| gemma | `systemd/units/gemma-31b.service` | `CMD_gemma=(...)` |
+| vision | `systemd/units/gemma-vision.service` | `CMD_vision=(...)` |
+| gptoss | `systemd/units/gptoss-20b.service` | `CMD_gptoss=(...)` |
+
+**Bump a slot's context window back to 256K** (example: coder)
+```bash
+# 1a. Edit the systemd unit (single value, sed-safe).
+sed -i 's/-c 131072/-c 262144/' systemd/units/qwen27-mtp.service
+# 1b. Hand-edit docker/docker-llm-switch: inside the CMD_coder=(...) block,
+#     change "-ngl 999 -fa on -c 131072" to "-c 262144".
+$EDITOR docker/docker-llm-switch
+
+# 2. Reload + restart.
+systemctl --user daemon-reload && llm-switch coder
+# Docker path: docker-llm-switch coder (recreates container with new CMD)
+```
+KV-cache impact at `q8_0/q8_0`: ~24 GB at 128K → ~48 GB at 256K. Still
+fits the 80 G `MemoryMax`. **Do not** also enable `--parallel 2` on
+the same slot — combined cost is ~96 GB and busts the cap.
+
+**Enable `--parallel 2` on a slot (concurrent requests)** (example: coder)
+```bash
+# 1a. Edit the systemd unit.
+sed -i 's/--parallel 1/--parallel 2/' systemd/units/qwen27-mtp.service
+# 1b. Hand-edit docker/docker-llm-switch: inside the CMD_coder=(...) block,
+#     change "--parallel 1" to "--parallel 2".
+$EDITOR docker/docker-llm-switch
+
+# 2. Reload + restart.
+systemctl --user daemon-reload && llm-switch coder
+```
+Doubles concurrent request capacity at 128K context (~48 GB total KV
+under the 80 G cap). Caveat: each in-flight request shares the slot's
+compute pool — two concurrent users see roughly half the per-request
+throughput. Enable only when concurrency matters more than single-user
+latency.
+
+**Reverting either change** is the same edit in reverse, then
+`daemon-reload` + slot restart. Both knobs are tracked in
+[`docs/architecture/DECISIONS.md`](docs/architecture/DECISIONS.md) §11.
 
 ### Pre-reboot checklist
 
