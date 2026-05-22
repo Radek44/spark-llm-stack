@@ -310,12 +310,17 @@ run_slot() {
   # Preserve a previously configured boot-default: if a stopped container
   # already exists with `--restart unless-stopped`, start it in place rather
   # than recreating it with `--rm`, which would silently drop the auto-start
-  # policy and desync `boot-status`.
+  # policy and desync `boot-status`. Note: `docker start` reuses the image
+  # and CMD baked into the existing container — to pick up a rebuilt image
+  # or an edited CMD_<slot>, re-run `boot-default <slot>`.
   if [ "$state" = "exited" ] \
      && [ "$(ctr_restart_policy "$name")" = "unless-stopped" ] \
      && [ "$(ctr_autoremove "$name")" != "true" ]; then
     echo "  $slot: starting existing boot-default container (restart=unless-stopped preserved)"
-    docker start "$name" >/dev/null
+    docker start "$name" >/dev/null || {
+      echo "  $slot: docker start failed" >&2
+      exit 1
+    }
     return 0
   fi
 
