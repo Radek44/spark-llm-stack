@@ -102,13 +102,19 @@ Important: the VAE-spike fix itself is `--disable-pinned-memory`, which
 we keep. `--reserve-vram` is independent headroom for activations, not
 the spike mitigation; raising it does not undo the spike fix.
 
-## 9. ComfyUI: `comfy-aimdo` installed
+## 9. ComfyUI: `comfy-aimdo` installed, pinned to `==0.3.0`
 
 NVIDIA-backed DynamicVRAM allocator. As of v0.3.0 (April 2026) it ships
 aarch64 wheels on PyPI — no source build. When importable, ComfyUI
 auto-detects it, enables async weight offload (default on Nvidia since
 ComfyUI PR #10953), and prevents memory creep across workflow switches.
 Logs `aimdo: comfy-aimdo inited for GPU: NVIDIA GB10` on start.
+
+**Pinned to `==0.3.0`** (not `>=0.3.0`): the research cites this exact
+version (RESEARCH.md §1 Finding 6); pinning prevents an unrelated minor
+release from changing memory behavior without a deliberate re-validation
+step. Bump after re-running the ComfyUI smoke checklist in
+`docker/SMOKE-TESTS.md` §5.
 
 ## 10. Llama threading: `--threads 16 --threads-batch 24` (was 8 / 16)
 

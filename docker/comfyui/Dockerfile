@@ -73,7 +73,10 @@ RUN pip install -r requirements.txt
 # NVIDIA-backed DynamicVRAM allocator (aarch64 wheels on PyPI since 0.3.0).
 # ComfyUI auto-detects it; enables async weight offload + prevents memory
 # creep across workflow switches on unified memory.
-RUN pip install 'comfy-aimdo>=0.3.0'
+# Pinned exactly: matches the version cited by the research (Triplany /
+# RESEARCH.md §1 Finding 6). Bump deliberately after re-validating, not
+# via dependency drift.
+RUN pip install 'comfy-aimdo==0.3.0'
 
 # Patch comfy/model_management.py for DGX Spark unified memory.
 #
