@@ -18,7 +18,7 @@ Every llama.cpp flag, env var, and memory limit came from what was already here:
 - **GB10 cmake flags** (`121a-real`, `GGML_CPU_KLEIDIAI`, `GGML_CUDA_FA_ALL_QUANTS`, `GGML_CUDA_FORCE_MMQ`) — copied verbatim from the README build section.
 - **`CMD` args** in the Dockerfile and `docker-llm-switch` slot tables — translated line-for-line from the `ExecStart` blocks in each `.service` file (`qwen27-mtp.service`, `qwen35-mtp.service`, `gemma-31b.service`, `gemma-vision.service`, `gptoss-20b.service`).
 - **CUDA env vars** (`CUDA_SCALE_LAUNCH_QUEUES=4x`, `GGML_CUDA_GRAPH_OPT=1`, `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1`) — lifted from the `Environment=` lines in every service unit.
-- **Memory caps** — `docker-llm-switch`'s `MEMCAP` and `MEMSOFT` tables map directly to the `MemoryMax` and `MemoryHigh` drop-in values from the POSTMORTEM hardening table. `--rm` + `--restart on-failure:3` replaces `OOMPolicy=stop` + `StartLimitBurst=3`; `stop_all_except` replaces `Conflicts=`.
+- **Memory caps** — `docker-llm-switch`'s `MEMCAP` and `MEMSOFT` tables map directly to the `MemoryMax` and `MemoryHigh` drop-in values from the POSTMORTEM hardening table. `--rm` (runtime) gives `OOMPolicy=stop` semantics; `--oom-score-adj=200` mirrors `OOMScoreAdjust=200`; `--restart unless-stopped` (boot-default) is the Docker analogue of `WantedBy=default.target`; `stop_all_except` replaces `Conflicts=`.
 - **`--host 0.0.0.0`** (not `127.0.0.1`) — the one deliberate delta from the service files, needed so traffic arriving on the host's `tailscale0` interface reaches the server.
 
 ---

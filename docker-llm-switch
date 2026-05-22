@@ -152,10 +152,6 @@ ctr_restart_policy() {
   docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$1" 2>/dev/null || echo ""
 }
 
-ctr_restart_max() {
-  docker inspect --format '{{.HostConfig.RestartPolicy.MaximumRetryCount}}' "$1" 2>/dev/null || echo ""
-}
-
 ctr_autoremove() {
   docker inspect --format '{{.HostConfig.AutoRemove}}' "$1" 2>/dev/null || echo ""
 }
