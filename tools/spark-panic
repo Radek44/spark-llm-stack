@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# spark-panic — DGX Spark cross-stack emergency stop.
+#
+# Stops every Docker container carrying the `spark.exclusive=true` label,
+# clears any restart policy so they don't auto-restart, and drops page cache.
+#
+# Triggered by:
+#   - operator manually:  `spark-panic`
+#   - earlyoom -N hook:   /usr/local/bin/spark-panic (before SIGKILL)
+#   - either switch:      `docker-llm-switch panic` / `autoresearch-switch panic`
+#
+# Idempotent. Safe to call repeatedly.
+#
+# Library lookup order (first readable wins):
+#   1. $SPARK_MEM_LIB env var (operator override; also useful in CI)
+#   2. ./docker/lib/spark-mem.sh (repo-relative; for developer ad-hoc use)
+#   3. /usr/local/lib/spark-mem.sh (authoritative install location; this is
+#      what earlyoom's -N hook will see because earlyoom runs as root,
+#      so $HOME and repo-relative paths are not safe defaults)
+#   4. /etc/spark-llm-stack/spark-mem.sh (alternate sysadmin install path)
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+candidates=(
+  "${SPARK_MEM_LIB:-}"
+  "${script_dir}/../docker/lib/spark-mem.sh"
+  "/usr/local/lib/spark-mem.sh"
+  "/etc/spark-llm-stack/spark-mem.sh"
+)
+
+LIB=""
+for candidate in "${candidates[@]}"; do
+  if [ -n "$candidate" ] && [ -r "$candidate" ]; then
+    LIB="$candidate"
+    break
+  fi
+done
+
+if [ -z "$LIB" ]; then
+  echo "spark-panic: cannot locate spark-mem.sh in any standard location:" >&2
+  printf '  - %s\n' "${candidates[@]}" >&2
+  echo "  set SPARK_MEM_LIB to override." >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+. "$LIB"
+
+spark_panic_stop_all

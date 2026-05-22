@@ -75,6 +75,67 @@ Core command:
 ./docker/autoresearch/scripts/autoresearch-switch start karpathy
 ```
 
+## Cross-stack memory failsafe (REQUIRED on the DGX host)
+
+Docker `--memory` and cgroup `memory.max` do **not** enforce caps on CUDA
+allocations on GB10 — confirmed in NVIDIA forums [#264689][f264689],
+[#353752][f353752], and [#358951][f358951] (NVIDIA staff explicitly recommend
+earlyoom as the mitigation). The repo therefore ships a three-layer userspace
+failsafe that works regardless of cgroup behaviour:
+
+1. **Admission gate** — `docker/lib/spark-mem.sh`, sourced by both switches.
+   Acquires a shared `flock`, checks `MemAvailable`, and (if a new workload's
+   cap would exceed the headroom) force-stops cross-stack containers before
+   launch. Switches now stamp every exclusive container with
+   `label spark.exclusive=true` so the enumeration works across both stacks.
+2. **Runtime watchdog** — `systemd/units/spark-earlyoom.service`. earlyoom
+   polls `/proc/meminfo`, fires SIGTERM at MemAvailable < 8 % and SIGKILL at
+   < 4 %, and runs `/usr/local/bin/spark-panic` *before* SIGKILL via the
+   `-N` hook — so containers stop gracefully instead of leaving zombie CUDA
+   contexts.
+3. **Panic / recovery** — `tools/spark-panic`, also reachable as
+   `docker-llm-switch panic` and `autoresearch-switch panic`. Stops every
+   container with the exclusive label across both stacks, clears restart
+   policies, and drops the page cache.
+
+Install:
+
+```bash
+sudo apt-get install -y earlyoom
+sudo cp docker/lib/spark-mem.sh    /usr/local/lib/spark-mem.sh
+sudo cp tools/spark-panic          /usr/local/bin/spark-panic
+sudo chmod +x /usr/local/bin/spark-panic
+sudo cp systemd/units/spark-earlyoom.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now spark-earlyoom.service
+```
+
+`spark_drop_caches` uses `sudo -n` (non-interactive) so the admission gate
+never blocks on a password prompt under SSH-without-TTY or cron. Grant
+NOPASSWD for the single command by adding this line via `sudo visudo`:
+
+```
+<your-operator-user> ALL=(root) NOPASSWD: /bin/sh -c sync; echo 3 > /proc/sys/vm/drop_caches
+```
+
+Without it, the failsafe still works — `drop_caches` just becomes a no-op
+and the admission gate runs against unflushed memory (visible in
+`journalctl` as `drop_caches failed (sudo -n required; configure NOPASSWD)`).
+
+Verify:
+
+```bash
+systemctl status spark-earlyoom        # active (running)
+docker-llm-switch panic                # idempotent
+spark-panic                            # same, manual route
+```
+
+Full design and citations: [`docs/research/autoresearch/findings_failsafe_design.md`](docs/research/autoresearch/findings_failsafe_design.md).
+
+[f264689]: https://forums.developer.nvidia.com/t/cuda-unified-memory-usage-is-not-accounted-by-linux-cgroup/264689
+[f353752]: https://forums.developer.nvidia.com/t/dgx-spark-becomes-unresponsive-zombie-instead-of-throwing-cuda-oom/353752
+[f358951]: https://forums.developer.nvidia.com/t/spark-hangs-requires-a-hard-reset-physically-unplugging/358951
+
 ## How everything wires together
 
 ```
@@ -186,11 +247,19 @@ A slot lives in four files that must stay in sync. Change one, change all:
   the same `--network=host` + bind-mounted-models pattern as the llama
   slots. ComfyUI additionally bind-mounts `~/comfyui/{custom_nodes,output,user}`
   so anything you install via the Manager web UI persists across rebuilds.
+- **GPU clock-lock on every boot**: GB10 firmware does not persist
+  clock/power settings; a power-spike during heavy work can hard-crash
+  the host. Run the `nvidia-smi -lgc / boost-slider / -pm` sequence
+  from [`docker/SMOKE-TESTS.md`](docker/SMOKE-TESTS.md) §0 before
+  exercising any slot.
 - **ComfyUI OOM warning**: ComfyUI on Blackwell unified memory has a
   known issue (Comfy-Org/ComfyUI#11106) where chaining VAE Decode with
-  Depth nodes can spike past 128 GB in seconds. The image already passes
-  `--disable-pinned-memory` and `--reserve-vram 2.0` to mitigate; if you
-  still hit it, batch in smaller tiles and avoid forcing `--gpu-only`.
+  Depth nodes can spike past 128 GB in seconds. The image passes
+  `--disable-pinned-memory` (the actual spike fix), `--reserve-vram 8.0`
+  (community-validated headroom; was 2.0 before docs/architecture/DECISIONS.md §"ComfyUI reserve-vram"),
+  pins SageAttention to v2.2.0 (v3 has mosaic artifacts on GB10), and
+  installs `comfy-aimdo` for the NVIDIA DynamicVRAM allocator. If you
+  still hit OOM, batch in smaller tiles and avoid forcing `--gpu-only`.
 
 ### Commands
 
@@ -580,7 +649,65 @@ bash systemd/harden-llm-stack.sh --revert # remove all drop-ins
 |---|---|---|
 | `--no-mmap` | **removed** | Anonymous pages can't be evicted on unified memory. Page cache is safer. |
 | `--mlock` | **removed** | Pins entire model permanently, starves other services. |
-| `-c 262144` | optional | Lower to `131072` for typical tasks; 256K context is rarely needed. |
+| `-c 131072` | **default** (128K) | Lowered from 262144 (256K) to halve KV-cache footprint. See "Tuning context + concurrency" below for how to bump back. |
+| `--parallel 1` | **default** | Memory-safe at 128K context (`--parallel 2` would fit, but doubles concurrent KV slots). See "Tuning context + concurrency" below. |
+
+### Tuning context + concurrency
+
+The defaults assume one heavy slot, one user at a time, ≤128K tokens of
+context. Two knobs commonly want tuning. Each lives in two mirrored
+files per slot — change both, then reload.
+
+Each slot has its values mirrored in two files: a per-slot
+`systemd/units/<slot>.service` (`sed` is safe here) AND a shared
+`docker/docker-llm-switch` with **one `CMD_<slot>=( ... )` block per
+slot** (manual edit — every block contains the same `-c 131072` /
+`--parallel 1`, so a blind `sed -i` would flip all five).
+
+| Slot | systemd unit | docker-llm-switch block |
+|---|---|---|
+| coder | `systemd/units/qwen27-mtp.service` | `CMD_coder=(...)` |
+| architect | `systemd/units/qwen35-mtp.service` | `CMD_architect=(...)` |
+| gemma | `systemd/units/gemma-31b.service` | `CMD_gemma=(...)` |
+| vision | `systemd/units/gemma-vision.service` | `CMD_vision=(...)` |
+| gptoss | `systemd/units/gptoss-20b.service` | `CMD_gptoss=(...)` |
+
+**Bump a slot's context window back to 256K** (example: coder)
+```bash
+# 1a. Edit the systemd unit (single value, sed-safe).
+sed -i 's/-c 131072/-c 262144/' systemd/units/qwen27-mtp.service
+# 1b. Hand-edit docker/docker-llm-switch: inside the CMD_coder=(...) block,
+#     change the "-c 131072" token to "-c 262144" (leave -ngl 999 -fa on intact).
+$EDITOR docker/docker-llm-switch
+
+# 2. Reload + restart.
+systemctl --user daemon-reload && llm-switch coder
+# Docker path: docker-llm-switch coder (recreates container with new CMD)
+```
+KV-cache impact at `q8_0/q8_0`: ~24 GB at 128K → ~48 GB at 256K. Still
+fits the 80 G `MemoryMax`. **Do not** also enable `--parallel 2` on
+the same slot — combined cost is ~96 GB and busts the cap.
+
+**Enable `--parallel 2` on a slot (concurrent requests)** (example: coder)
+```bash
+# 1a. Edit the systemd unit.
+sed -i 's/--parallel 1/--parallel 2/' systemd/units/qwen27-mtp.service
+# 1b. Hand-edit docker/docker-llm-switch: inside the CMD_coder=(...) block,
+#     change "--parallel 1" to "--parallel 2".
+$EDITOR docker/docker-llm-switch
+
+# 2. Reload + restart.
+systemctl --user daemon-reload && llm-switch coder
+```
+Doubles concurrent request capacity at 128K context (~48 GB total KV
+under the 80 G cap). Caveat: each in-flight request shares the slot's
+compute pool — two concurrent users see roughly half the per-request
+throughput. Enable only when concurrency matters more than single-user
+latency.
+
+**Reverting either change** is the same edit in reverse, then
+`daemon-reload` + slot restart. Both knobs are tracked in
+[`docs/architecture/DECISIONS.md`](docs/architecture/DECISIONS.md) §11.
 
 ### Pre-reboot checklist
 

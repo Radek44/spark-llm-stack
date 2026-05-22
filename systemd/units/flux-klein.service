@@ -1,3 +1,6 @@
+# --threads 16 (was 8): FLUX text encoder (Qwen3-4B) runs CPU-side; see
+# docs/architecture/DECISIONS.md §10.
+
 [Unit]
 Description=FLUX.2-klein Image Gen on 8160
 After=network-online.target
@@ -15,7 +18,7 @@ ExecStart=/home/radek/src/stable-diffusion.cpp/build/bin/sd-server \
   --listen-port 8160 \
   --diffusion-fa \
   --type f16 \
-  --threads 8
+  --threads 16
 
 Restart=on-failure
 RestartSec=5
