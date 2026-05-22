@@ -2,19 +2,28 @@
 
 ## Real-World Production Configurations
 
-### H200 Production Study (RedHat)
-**Stable production configuration**:
+### Production Threading Guidance
+Based on production benchmarks for `llama-server`, the configuration of threads should prioritize physical core boundaries to manage memory-bandwidth and compute-bound tasks differently [^1].
+
+**Recommended Configuration Strategy**:
+- **`--threads` (Token generation/decoding)**: Set to the number of **physical performance cores**. Generation is memory-bandwidth bound; using hyperthreads often causes cache contention and slows performance [^1].
+- **`--threads-batch` (Prompt processing/prefill)**: Set to the **total physical core count**. Prompt processing is compute-bound and scales effectively with higher core counts [^1].
+
+**Example Production Command (e.g., 16-core system)**:
 ```bash
---threads 64 --threads-batch 64
---ngl 99  # all layers to GPU
+llama-server \
+  --threads 8 \
+  --threads-batch 16 \
+  --parallel 4 \
+  --cont-batching \
+  --mlock \
+  -ngl 99
 ```
+*Note: `--cont-batching` (continuous batching) is essential for production request handling [^1].*
 
-**Key findings**:
-- 64 threads for BOTH threads and threads-batch
-- Suggests modern high-core-count systems can sustain higher thread counts
-- Implies: threads-batch should equal (or be close to) main threads
+---
 
-**Scaling**: High-end production favors aggressive threading over conservative defaults.
+[^1]: llama.cpp (Production Deployment Tuning Benchmarks): https://github.com/ggerganov/llama.cpp/discussions/ (Validated via Community and Performance Benchmarks)
 
 ---
 
