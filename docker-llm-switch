@@ -152,6 +152,14 @@ ctr_restart_policy() {
   docker inspect --format '{{.HostConfig.RestartPolicy.Name}}' "$1" 2>/dev/null || echo ""
 }
 
+ctr_restart_max() {
+  docker inspect --format '{{.HostConfig.RestartPolicy.MaximumRetryCount}}' "$1" 2>/dev/null || echo ""
+}
+
+ctr_autoremove() {
+  docker inspect --format '{{.HostConfig.AutoRemove}}' "$1" 2>/dev/null || echo ""
+}
+
 stop_all_except() {
   local keep="$1"
   for slot in "${SLOTS[@]}"; do
@@ -266,13 +274,23 @@ boot_default() {
           echo "  $s: created with --restart on-failure:3"
           ;;
         running)
-          # Running containers were started by run_slot with --rm, so
-          # `docker update --restart` would fail. Stop and recreate without
-          # --rm so the on-failure:3 policy actually applies at next boot.
-          echo "  $s: already running with --rm; recreating with --restart on-failure:3"
-          docker stop "$name" >/dev/null
-          [ "$(ctr_state "$name")" = "exited" ] && docker rm "$name" >/dev/null 2>&1 || true
-          docker_run_slot "$slot" --restart on-failure:3
+          # Three cases:
+          # 1. Already configured (non-rm, on-failure:3) → no-op, idempotent.
+          # 2. Non-rm but wrong policy → `docker update` in place, no downtime.
+          # 3. Started with --rm (by run_slot) → `docker update` would fail;
+          #    must stop and recreate without --rm.
+          if [ "$(ctr_autoremove "$name")" = "true" ]; then
+            echo "  $s: running with --rm; recreating with --restart on-failure:3"
+            docker stop "$name" >/dev/null
+            [ "$(ctr_state "$name")" = "exited" ] && docker rm "$name" >/dev/null 2>&1 || true
+            docker_run_slot "$slot" --restart on-failure:3
+          elif [ "$(ctr_restart_policy "$name")" = "on-failure" ] \
+               && [ "$(ctr_restart_max "$name")" = "3" ]; then
+            echo "  $s: already configured (on-failure:3), no change"
+          else
+            docker update --restart on-failure:3 "$name" >/dev/null
+            echo "  $s: restart policy updated → on-failure:3 (no restart)"
+          fi
           ;;
       esac
     else
