@@ -102,7 +102,7 @@ declare -A IMAGE=(
 # ── slot CMD args (mirror the *.service ExecStart, with --host 0.0.0.0) ───────
 
 CMD_coder=(
-  -m /models/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf
+  -m /models/Qwen3.6-27B-UD-Q4_K_XL.gguf
   --alias qwen3.6-27b-coder
   --host 0.0.0.0 --port "${PORTS[coder]}"
   -ngl 999 -fa on -c 131072
@@ -120,7 +120,7 @@ CMD_coder=(
 )
 
 CMD_architect=(
-  -m /models/Qwen3.6-35B-A3B-MTP-Q4_K_XL.gguf
+  -m /models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
   --alias qwen3.6-35b-architect
   --host 0.0.0.0 --port "${PORTS[architect]}"
   -ngl 999 -fa on -c 131072
