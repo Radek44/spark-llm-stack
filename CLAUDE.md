@@ -40,7 +40,7 @@ systemctl --user daemon-reload
 cp systemd/llm-switch tools/flux-gen ~/.local/bin/ && chmod +x ~/.local/bin/llm-switch ~/.local/bin/flux-gen
 ```
 
-The `reference-previous/drop-ins/` directory is a **reference copy** of the generated drop-ins. The live drop-ins are at `~/.config/systemd/user/<unit>.d/override.conf`. `systemd/harden-llm-stack.sh` writes (and reverts) those live files directly.
+The `.archive/reference-previous_drop-ins/` directory is a **reference copy** of the generated drop-ins. The live drop-ins are at `~/.config/systemd/user/<unit>.d/override.conf`. `systemd/harden-llm-stack.sh` writes (and reverts) those live files directly.
 
 ## MTP binary note
 

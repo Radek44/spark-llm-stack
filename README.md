@@ -64,10 +64,12 @@ spark-llm-stack/
 │                                  kernel ABI bumps without the matching
 │                                  linux-modules-nvidia-580-open-<KVER> package
 │
-└── reference-previous/          archival material — read for context, not for execution
-    └── drop-ins/                snapshot of what harden-llm-stack.sh writes
-                                 to ~/.config/systemd/user/<unit>.d/override.conf
-                                 (live files — this is just a reference copy)
+└── .archive/                    retired material — kept tracked for history, not for execution
+    ├── 000_nvidia-drivers_HANDOFF.md     resolved nvidia-drivers handoff
+    ├── 001_pr3_HANDOFF.md                resolved PR #3 review remediations
+    └── reference-previous_drop-ins/      snapshot of what harden-llm-stack.sh writes
+                                          to ~/.config/systemd/user/<unit>.d/override.conf
+                                          (live files — this is just a reference copy)
 ```
 
 ## Autoresearch launcher
@@ -389,7 +391,7 @@ cp systemd/units/*.service ~/.config/systemd/user/
 bash systemd/harden-llm-stack.sh
 
 # Or manually, copying the reference overlay:
-for d in reference-previous/drop-ins/*/; do
+for d in .archive/reference-previous_drop-ins/*/; do
   svc=$(basename "$d")
   mkdir -p ~/.config/systemd/user/$svc
   cp "$d/override.conf" ~/.config/systemd/user/$svc/
