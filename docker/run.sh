@@ -3,7 +3,7 @@
 #
 # This is a thin wrapper that delegates to docker-llm-switch so the mutual
 # exclusion invariant (stop all other spark-llm-* containers before starting
-# a new one) is always enforced. See CLAUDE.md and POSTMORTEM.md for why
+# a new one) is always enforced. See CLAUDE.md and gremlins/00_POSTMORTEM.md for why
 # running two heavyweight slots simultaneously bricks the box.
 #
 # Tailscale access: containers run with --network=host, reachable at

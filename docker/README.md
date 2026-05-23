@@ -13,7 +13,7 @@ For the autoresearch launcher see [`autoresearch/README.md`](autoresearch/README
 - **Single-slot rule**: running more than one heavyweight slot exhausts the
   128 GB unified memory pool and triggers an OOM respawn brick loop. Always
   use `docker-llm-switch` or `./run.sh` — never raw `docker run`. See
-  [POSTMORTEM.md](../reference-previous/POSTMORTEM.md).
+  [gremlins/00_POSTMORTEM.md](../gremlins/00_POSTMORTEM.md).
 - **Requirements**: NVIDIA driver 580+, CUDA 13.0+, NVIDIA Container Toolkit,
   Docker with `--gpus=all` working (`docker run --rm --gpus=all nvidia/cuda:13.2.0-base-ubuntu24.04 nvidia-smi`).
 - **Disk**: ~20 GB for all three images + model weights (~80 GB full roster).
@@ -226,7 +226,7 @@ confirmed `nvidia/cuda:13.2.0-devel-ubuntu24.04` as the right base for GB10
 aarch64; contributed the multi-stage build pattern and `BUILD_JOBS` parallelism
 arg.
 
-**This repo's `.service` files + POSTMORTEM.md** — every llama.cpp flag, env
+**This repo's `.service` files + gremlins/00_POSTMORTEM.md** — every llama.cpp flag, env
 var, and memory limit was translated line-for-line from `ExecStart` blocks.
 `--host 0.0.0.0` is the only deliberate delta (needed for Tailscale access).
 

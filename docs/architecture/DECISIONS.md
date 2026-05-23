@@ -16,7 +16,7 @@ The cross-stack memory failsafe design lives at
 
 Running ≥2 heavyweight services simultaneously exhausts 128 GB unified
 memory and triggers a systemd OOM respawn loop that bricks the host.
-See `reference-previous/POSTMORTEM.md`. The fix is enforced in two
+See `gremlins/00_POSTMORTEM.md`. The fix is enforced in two
 parallel places:
 
 - **systemd**: `Conflicts=` drop-ins written by `systemd/harden-llm-stack.sh`

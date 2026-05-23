@@ -27,7 +27,7 @@ Instead of a clean CUDA OOM exception, the DGX Spark often becomes **unresponsiv
 - No CUDA OOM thrown
 - Hard reboot (physical unplug) required to recover
 - Reproducible at ~95–100% unified memory utilization
-(Status: Confirmed - referenced in reference-previous/POSTMORTEM.md)
+(Status: Confirmed - referenced in gremlins/00_POSTMORTEM.md)
 
 ---
 
