@@ -24,37 +24,23 @@ For the autoresearch launcher see [`autoresearch/README.md`](autoresearch/README
 
 Models live on the host at `~/models/` and are bind-mounted into containers at `/models`.
 
+### Download all llama models at once (~61 GB total)
+
 ```bash
 mkdir -p ~/models
 
-# Coder — Qwen3.6-27B dense (~17 GB) — recommended first
-# NOTE: "MTP" appears only in the repo name, not the filename inside it.
-hf download unsloth/Qwen3.6-27B-MTP-GGUF \
-  Qwen3.6-27B-UD-Q4_K_XL.gguf \
-  --local-dir ~/models
-
-# Architect — Qwen3.6-35B-A3B MoE (~22 GB)
-# NOTE: same pattern — MTP in repo name only, not filename.
-hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF \
-  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-  --local-dir ~/models
-
-# Gemma 31B — alt reasoning + image input (~19 GB)
-hf download unsloth/gemma-4-31B-it-GGUF \
-  gemma-4-31B-it-UD-Q4_K_XL.gguf \
-  --local-dir ~/models
-
-# Gemma vision 4B — fast vision + audio (~3 GB)
-hf download unsloth/gemma-4-E4B-it-GGUF \
-  gemma-4-E4B-it-UD-Q4_K_XL.gguf \
-  --local-dir ~/models
+# NOTE: "MTP" appears in HuggingFace repo names but NOT in the filenames inside.
+hf download unsloth/Qwen3.6-27B-MTP-GGUF  Qwen3.6-27B-UD-Q4_K_XL.gguf      --local-dir ~/models  # coder     ~17 GB
+hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --local-dir ~/models  # architect ~22 GB
+hf download unsloth/gemma-4-31B-it-GGUF    gemma-4-31B-it-UD-Q4_K_XL.gguf   --local-dir ~/models  # gemma     ~19 GB
+hf download unsloth/gemma-4-E4B-it-GGUF    gemma-4-E4B-it-UD-Q4_K_XL.gguf   --local-dir ~/models  # vision    ~3 GB
 ```
 
 Notes:
 - `gptoss` uses `--gpt-oss-20b-default` — a built-in flag in the MTP llama.cpp
   binary; no GGUF download needed.
 - `hf` is the HuggingFace CLI. Install with: `pip install huggingface_hub[cli]`
-- For FLUX/imagine model files see the [FLUX section](#flux2-klein-model-files) below.
+- For FLUX/imagine model files (~17 GB) see the [FLUX section](#flux2-klein-model-files) below.
 
 ---
 
@@ -120,16 +106,73 @@ docker-llm-switch boot-safe               # clear all restart policies
 
 ---
 
-## Custom nodes for ComfyUI
+## ComfyUI installation (Docker path)
 
-`~/comfyui/custom_nodes/` on the host is bind-mounted into the container. On
-every start the entrypoint seeds ComfyUI-Manager via `cp -rn` (no-clobber), so
-it's available immediately without clobbering anything you've added. Install
-additional nodes through the Manager web UI or by `git clone`-ing into
+Everything is already wired up. The image builds from `docker/comfyui/Dockerfile`.
+
+**1. Build the image**
+
+```bash
+# From repo root
+docker compose -f docker/docker-compose.yml build comfyui
+```
+
+This takes a while — it compiles SageAttention from source with `sm_121a` SASS.
+
+**2. Put your models in `~/models/`**
+
+ComfyUI expects the standard subdirectory layout inside its `models/` folder.
+The container bind-mounts `~/models` → `/opt/ComfyUI/models`:
+
+```
+~/models/
+  checkpoints/   ← diffusion models (.safetensors)
+  vae/
+  clip/
+  loras/
+  ...
+```
+
+**3. Start it**
+
+```bash
+docker-llm-switch comfyui
+# or: ./docker/run.sh comfyui
+```
+
+First model load takes 60–90 s — the `wait_ready` loop polls `/system_stats`
+and prints dots until ready. Access at `http://localhost:8188`.
+
+**4. Custom nodes persist automatically**
+
+The entrypoint seeds ComfyUI-Manager into `~/comfyui/custom_nodes/` on first
+run (using `cp -n` so existing nodes are never clobbered). Three bind-mounts
+survive image rebuilds:
+
+```
+~/comfyui/custom_nodes/  ↔  /opt/ComfyUI/custom_nodes
+~/comfyui/output/        ↔  /opt/ComfyUI/output
+~/comfyui/user/          ↔  /opt/ComfyUI/user
+```
+
+Install new nodes through the Manager web UI or by `git clone`-ing into
 `~/comfyui/custom_nodes/` and restarting the container.
 
-- Workflows / settings: `~/comfyui/user/`
-- Generated images: `~/comfyui/output/`
+**GB10-specific notes**
+
+- The `model_management.py` patch in the Dockerfile replaces `cudaMemGetInfo()`
+  with `psutil.virtual_memory().available`. On GB10's unified memory, CUDA's
+  query can report ~6 GB free when 40+ GB are actually available (it sees
+  another process's reservation, not the physical pool). Without the patch,
+  ComfyUI would partially offload models unnecessarily.
+- SageAttention is pinned to v2.2.0 (not v3) — v3 produces mosaic artifacts
+  on GB10 (thu-ml/SageAttention#321). FlashAttention 2/3 has no working
+  aarch64 wheel for SM 12.1 at all.
+
+**Env overrides**
+
+`COMFY_DIR` defaults to `~/comfyui`, `MODELS_DIR` to `~/models`. Both can be
+overridden if your layout differs.
 
 ---
 
