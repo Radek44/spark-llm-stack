@@ -179,22 +179,23 @@ overridden if your layout differs.
 ## FLUX.2-klein model files
 
 ```bash
-mkdir -p ~/models/flux2-klein/text_encoder
+mkdir -p ~/models/flux2-klein
 
 # Main model (~8 GB, Apache 2.0)
 huggingface-cli download black-forest-labs/FLUX.2-klein-4B \
   flux-2-klein-4b.safetensors --local-dir ~/models/flux2-klein --local-dir-use-symlinks False
 
-# VAE (~335 MB)
+# VAE (~335 MB) — rename to ae.safetensors (path expected by docker-llm-switch)
 huggingface-cli download Comfy-Org/flux2-dev \
-  split_files/vae/flux2-vae.safetensors --local-dir ~/models/flux2-klein --local-dir-use-symlinks False
+  split_files/vae/flux2-vae.safetensors --local-dir ~/models/flux2-klein --local-dir-use-symlinks False && \
+  mv ~/models/flux2-klein/split_files/vae/flux2-vae.safetensors ~/models/flux2-klein/ae.safetensors
 
 # Text encoder shards (~8 GB total)
 huggingface-cli download black-forest-labs/FLUX.2-klein-4B \
-  text_encoder/ --local-dir ~/models/flux2-klein/text_encoder --local-dir-use-symlinks False
+  text_encoder/ --local-dir ~/models/flux2-klein --local-dir-use-symlinks False
 
-# Merge shards into single file (required once)
-python3 -c "
+# Merge shards into single file (required once; run from ~/models/flux2-klein)
+cd ~/models/flux2-klein && python3 -c "
 from safetensors.torch import save_file, load_file
 base = 'text_encoder'
 s1 = load_file(f'{base}/model-00001-of-00002.safetensors')
