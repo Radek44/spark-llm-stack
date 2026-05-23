@@ -337,15 +337,15 @@ hf download Comfy-Org/flux2-dev \
 hf download black-forest-labs/FLUX.2-klein-4B \
   text_encoder/ --local-dir ~/models/flux2-klein/text_encoder
 
-# Merge shards into single file (required once)
-python3 -c "
+# Merge shards into single file (required once; run from ~/models/flux2-klein)
+cd ~/models/flux2-klein && ~/jupyterlab/.venv/bin/python3 -c "
 from safetensors.torch import save_file, load_file
 base = 'text_encoder'
 s1 = load_file(f'{base}/model-00001-of-00002.safetensors')
 s2 = load_file(f'{base}/model-00002-of-00002.safetensors')
 save_file({**s1, **s2}, f'{base}/qwen_3_4b.safetensors')
 print('Done')
-" 
+"
 ```
 
 ---
