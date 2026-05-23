@@ -16,6 +16,27 @@
 #                                            edits — use the .bak files)
 #
 # Run as your normal user (radek). The script sudo's for system unit changes.
+#
+# TODO (memory caps are vestigial on GB10 UMA):
+#   The MemoryHigh= / MemoryMax= values below were copied from H100-style
+#   guidance and do NOT enforce on DGX Spark. CUDA unified-memory allocations
+#   go through /dev/nvidia-uvm at the root cgroup and bypass the memory
+#   controller entirely. Sources: NVIDIA forums #264689, #353752, #358951,
+#   and docs/research/autoresearch/findings_failsafe_design.md §2.
+#
+#   Real OOM enforcement on this host comes from the three-layer failsafe:
+#     1. admission gate (planning budgets in .env.autoresearch + spark-mem.sh)
+#     2. runtime watchdog (systemd/units/spark-earlyoom.service)
+#     3. preempt hook    (tools/spark-panic via earlyoom -N)
+#
+#   To revisit:
+#     - Decide whether to strip the MemoryHigh=/MemoryMax= lines from this
+#       script (keeping only OOMPolicy=stop, Conflicts=, StartLimitBurst=3,
+#       OOMScoreAdjust=200), or keep them as documentation/defence-in-depth
+#       in case a future kernel/driver gains UVM cgroup accounting.
+#     - If stripping: simplify the SERVICES=() schema (drop the High/Max
+#       columns), update the README "Hardening" section, and note the
+#       change in docs/architecture/DECISIONS.md.
 
 set -uo pipefail
 
