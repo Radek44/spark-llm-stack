@@ -29,6 +29,42 @@ WAIT_TIMEOUT=300
 
 SLOTS=(coder architect gemma vision gptoss imagine comfyui)
 
+# ── cross-stack failsafe library (docker/lib/spark-mem.sh) ────────────────────
+#
+# Provides: spark_acquire_lock, spark_admission_check,
+# spark_cross_stack_stop_others, spark_drop_caches, spark_panic_stop_all,
+# spark_parse_gb. See docker/lib/spark-mem.sh for rationale.
+_SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SPARK_MEM_LIB="${SPARK_MEM_LIB:-$_SCRIPT_DIR/lib/spark-mem.sh}"
+if [ ! -r "$SPARK_MEM_LIB" ]; then
+  # When installed to ~/.local/bin the lib is no longer adjacent — check the
+  # standard install locations.
+  for _cand in /usr/local/lib/spark-mem.sh /etc/spark-llm-stack/spark-mem.sh \
+               "$HOME/spark-llm-stack/docker/lib/spark-mem.sh"; do
+    [ -r "$_cand" ] && SPARK_MEM_LIB="$_cand" && break
+  done
+fi
+if [ -r "$SPARK_MEM_LIB" ]; then
+  # shellcheck source=lib/spark-mem.sh
+  . "$SPARK_MEM_LIB"
+else
+  echo "docker-llm-switch: warning — spark-mem.sh not found; failsafe shims active" >&2
+  spark_acquire_lock() { :; }
+  spark_admission_check() { return 0; }
+  spark_cross_stack_stop_others() { :; }
+  spark_drop_caches() { sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true; }
+  spark_panic_stop_all() {
+    echo "spark-panic shim: stopping every spark-* docker container" >&2
+    docker ps -q --filter "name=spark-" | xargs -r docker stop -t 10 >/dev/null 2>&1 || true
+  }
+  spark_parse_gb() {
+    local r="${1:-0}"
+    r=$(printf '%s' "$r" | tr '[:upper:]' '[:lower:]')
+    # %%g* greedy-strips everything from the first 'g' so "40gb" -> "40", not "40b".
+    case "$r" in *gb|*g) echo "${r%%g*}" ;; *) echo 0 ;; esac
+  }
+fi
+
 declare -A PORTS=(
   [coder]=8152 [architect]=8154 [gemma]=8156 [vision]=8155 [gptoss]=8157
   [imagine]=8160 [comfyui]=8188
@@ -66,15 +102,15 @@ declare -A IMAGE=(
 # ── slot CMD args (mirror the *.service ExecStart, with --host 0.0.0.0) ───────
 
 CMD_coder=(
-  -m /models/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf
+  -m /models/Qwen3.6-27B-UD-Q4_K_XL.gguf
   --alias qwen3.6-27b-coder
   --host 0.0.0.0 --port "${PORTS[coder]}"
-  -ngl 999 -fa on -c 262144
+  -ngl 999 -fa on -c 131072
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
   --ctx-checkpoints 128 --cache-reuse 1024
   -b 32768 -ub 8192 --parallel 1
-  --threads 8 --threads-batch 16 --threads-http 4
+  --threads 16 --threads-batch 24 --threads-http 4
   --prio 3 --poll 100
   --spec-type draft-mtp
   --spec-draft-n-max 5 --spec-draft-n-min 1 --spec-draft-p-min 0.75
@@ -84,16 +120,15 @@ CMD_coder=(
 )
 
 CMD_architect=(
-  -m /models/Qwen3.6-35B-A3B-MTP-Q4_K_XL.gguf
+  -m /models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
   --alias qwen3.6-35b-architect
   --host 0.0.0.0 --port "${PORTS[architect]}"
-  -ngl 999 -fa on -c 262144
+  -ngl 999 -fa on -c 131072
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
   --ctx-checkpoints 64 --cache-reuse 1024
   -b 16384 -ub 4096 --parallel 1
-  --threads 8 --cpu-range 0-9
-  --threads-batch 16 --cpu-range-batch 10-19
+  --threads 16 --threads-batch 24
   --threads-http 4 --prio 2 --poll 50
   --reasoning on --reasoning-budget 4000 --reasoning-format deepseek
   --jinja
@@ -105,13 +140,12 @@ CMD_gemma=(
   -m /models/gemma-4-31B-it-UD-Q4_K_XL.gguf
   --alias gemma4-31b
   --host 0.0.0.0 --port "${PORTS[gemma]}"
-  -ngl 999 -fa on -c 262144
+  -ngl 999 -fa on -c 131072
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 49152 --cache-idle-slots
   --ctx-checkpoints 64 --cache-reuse 1024
   -b 16384 -ub 4096 --parallel 1
-  --threads 8 --cpu-range 0-9
-  --threads-batch 16 --cpu-range-batch 10-19
+  --threads 16 --threads-batch 24
   --threads-http 4 --prio 2 --poll 50
   --reasoning on --reasoning-budget 4000 --reasoning-format deepseek
   --jinja
@@ -127,8 +161,7 @@ CMD_vision=(
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 8192 --cache-reuse 256
   -b 8192 -ub 2048 --parallel 1
-  --threads 8 --cpu-range 0-9
-  --threads-batch 10 --cpu-range-batch 10-19
+  --threads 16 --threads-batch 16
   --threads-http 4 --prio 2 --poll 50
   --reasoning off --jinja
   --temp 1.0 --top-k 64 --top-p 0.95 --min-p 0.0
@@ -143,8 +176,7 @@ CMD_gptoss=(
   --cache-type-k q8_0 --cache-type-v q8_0 --kv-unified
   --cache-ram 16384 --cache-idle-slots --cache-reuse 512
   -b 16384 -ub 4096 --parallel 1
-  --threads 8 --cpu-range 0-9
-  --threads-batch 16 --cpu-range-batch 10-19
+  --threads 16 --threads-batch 24
   --threads-http 4 --prio 2 --poll 50
   --jinja
   --temp 0.7 --top-k 40 --top-p 0.95 --min-p 0.0
@@ -161,7 +193,7 @@ CMD_imagine=(
   --listen-port "${PORTS[imagine]}"
   --diffusion-fa
   --type f16
-  --threads 8
+  --threads 16
 )
 
 # ComfyUI. Listen on 0.0.0.0 (host network), and the Grace-unified-memory
@@ -170,7 +202,7 @@ CMD_comfyui=(
   --listen 0.0.0.0
   --port "${PORTS[comfyui]}"
   --disable-pinned-memory
-  --reserve-vram 2.0
+  --reserve-vram 8.0
 )
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -296,6 +328,9 @@ docker_run_slot() {
     --oom-score-adj=200 \
     --ulimit memlock=-1:-1 \
     --shm-size=1g \
+    --label "spark.exclusive=true" \
+    --label "spark.stack=llm" \
+    --label "spark.slot=$slot" \
     "${extra_mounts[@]}" \
     -e "HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}" \
     "$image" \
@@ -447,7 +482,39 @@ is_slot() {
 if is_slot "$CMD"; then
   target=$(ctr_name "$CMD")
   echo "→ $CMD mode (${ROLES[$CMD]})"
+
+  # Idempotency: if the target slot is already running, this is a no-op.
+  # Skip the failsafe block entirely — running drop_caches / admission /
+  # cross_stack_stop_others on an "ensure up" call would evict in-flight
+  # cross-stack workloads despite no new container being started.
+  if [ "$(ctr_state "$target")" = "running" ]; then
+    echo "  already running"
+    show_status
+    exit 0
+  fi
+
+  # Layer 1 of the cross-stack failsafe: shared mutex + admission gate.
+  spark_acquire_lock || exit 1
+
+  # Intra-stack: stop other spark-llm-* slots (existing behaviour).
   stop_all_except "$target"
+
+  # Flush BEFORE admission so the check sees post-flush MemAvailable —
+  # mirrors autoresearch-switch, keeps cross-stack eviction policy
+  # symmetric regardless of which switch initiated the start.
+  spark_drop_caches
+
+  # Cross-stack admission gate: if this slot's cap fits within available
+  # memory (minus 8 GiB headroom), allow coexistence with autoresearch
+  # containers; otherwise stop the cross-stack set first.
+  projected_gb=$(spark_parse_gb "${MEMCAP[$CMD]}")
+  if ! spark_admission_check "$projected_gb"; then
+    echo "  insufficient memory for $CMD (${projected_gb}GiB cap); stopping cross-stack containers"
+    spark_cross_stack_stop_others "$target"
+  else
+    echo "  admission ok: ${projected_gb}GiB fits without stopping cross-stack containers"
+  fi
+
   if [ "$(ctr_state "$target")" = "running" ]; then
     echo "  already running"
   else
@@ -484,6 +551,9 @@ case "$CMD" in
   boot-status)
     boot_status
     ;;
+  panic)
+    spark_panic_stop_all
+    ;;
   -h|--help|help)
     cat <<EOF
 docker-llm-switch — Docker-native llm-switch for DGX Spark GB10
@@ -498,6 +568,13 @@ Boot (Docker daemon restart policy):
   docker-llm-switch boot-default <slot>
                                     set ONE slot to --restart unless-stopped
   docker-llm-switch boot-status     show what auto-starts at Docker boot
+
+Cross-stack failsafe:
+  docker-llm-switch panic           emergency stop of EVERY container with
+                                    label spark.exclusive=true (BOTH stacks),
+                                    clears restart policies, drops page cache.
+                                    Same effect as autoresearch-switch panic
+                                    or /usr/local/bin/spark-panic.
 
 Slots: ${SLOTS[*]}
 

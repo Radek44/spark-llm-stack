@@ -75,6 +75,67 @@ Core command:
 ./docker/autoresearch/scripts/autoresearch-switch start karpathy
 ```
 
+## Cross-stack memory failsafe (REQUIRED on the DGX host)
+
+Docker `--memory` and cgroup `memory.max` do **not** enforce caps on CUDA
+allocations on GB10 — confirmed in NVIDIA forums [#264689][f264689],
+[#353752][f353752], and [#358951][f358951] (NVIDIA staff explicitly recommend
+earlyoom as the mitigation). The repo therefore ships a three-layer userspace
+failsafe that works regardless of cgroup behaviour:
+
+1. **Admission gate** — `docker/lib/spark-mem.sh`, sourced by both switches.
+   Acquires a shared `flock`, checks `MemAvailable`, and (if a new workload's
+   cap would exceed the headroom) force-stops cross-stack containers before
+   launch. Switches now stamp every exclusive container with
+   `label spark.exclusive=true` so the enumeration works across both stacks.
+2. **Runtime watchdog** — `systemd/units/spark-earlyoom.service`. earlyoom
+   polls `/proc/meminfo`, fires SIGTERM at MemAvailable < 8 % and SIGKILL at
+   < 4 %, and runs `/usr/local/bin/spark-panic` *before* SIGKILL via the
+   `-N` hook — so containers stop gracefully instead of leaving zombie CUDA
+   contexts.
+3. **Panic / recovery** — `tools/spark-panic`, also reachable as
+   `docker-llm-switch panic` and `autoresearch-switch panic`. Stops every
+   container with the exclusive label across both stacks, clears restart
+   policies, and drops the page cache.
+
+Install:
+
+```bash
+sudo apt-get install -y earlyoom
+sudo cp docker/lib/spark-mem.sh    /usr/local/lib/spark-mem.sh
+sudo cp tools/spark-panic          /usr/local/bin/spark-panic
+sudo chmod +x /usr/local/bin/spark-panic
+sudo cp systemd/units/spark-earlyoom.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now spark-earlyoom.service
+```
+
+`spark_drop_caches` uses `sudo -n` (non-interactive) so the admission gate
+never blocks on a password prompt under SSH-without-TTY or cron. Grant
+NOPASSWD for the single command by adding this line via `sudo visudo`:
+
+```
+<your-operator-user> ALL=(root) NOPASSWD: /bin/sh -c sync; echo 3 > /proc/sys/vm/drop_caches
+```
+
+Without it, the failsafe still works — `drop_caches` just becomes a no-op
+and the admission gate runs against unflushed memory (visible in
+`journalctl` as `drop_caches failed (sudo -n required; configure NOPASSWD)`).
+
+Verify:
+
+```bash
+systemctl status spark-earlyoom        # active (running)
+docker-llm-switch panic                # idempotent
+spark-panic                            # same, manual route
+```
+
+Full design and citations: [`docs/research/autoresearch/findings_failsafe_design.md`](docs/research/autoresearch/findings_failsafe_design.md).
+
+[f264689]: https://forums.developer.nvidia.com/t/cuda-unified-memory-usage-is-not-accounted-by-linux-cgroup/264689
+[f353752]: https://forums.developer.nvidia.com/t/dgx-spark-becomes-unresponsive-zombie-instead-of-throwing-cuda-oom/353752
+[f358951]: https://forums.developer.nvidia.com/t/spark-hangs-requires-a-hard-reset-physically-unplugging/358951
+
 ## How everything wires together
 
 ```
@@ -151,168 +212,9 @@ A slot lives in four files that must stay in sync. Change one, change all:
 
 ## Docker quickstart
 
-### Before you begin (read this — it'll save you a brick)
-
-- **Hardware**: NVIDIA DGX Spark GB10 (Grace Blackwell, aarch64, SM 12.1).
-  The cmake flag `121a-real` and the env vars `CUDA_SCALE_LAUNCH_QUEUES=4x`
-  / `GGML_CUDA_GRAPH_OPT=1` only apply on this chip. Other CUDA cards will
-  build but won't get the tuned SASS path.
-- **Driver**: NVIDIA driver 580 or newer, CUDA 13.0+.
-- **Docker**: with the NVIDIA Container Toolkit installed and tested
-  (`docker run --rm --gpus=all nvidia/cuda:13.2.0-base-ubuntu24.04
-  nvidia-smi`).
-- **Disk**: ~20 GB for the image, plus model weights (≈80 GB across the
-  full roster — Qwen3.6-27B alone is ~17 GB).
-- **Models directory**: create `~/models/` and put your GGUFs there. The
-  container bind-mounts it at `/models`. To download weights inside the
-  container, export `HUGGING_FACE_HUB_TOKEN` first.
-- **Network**: containers run `--network=host`. Slots bind to `0.0.0.0`
-  on `:8152` / `:8154` / `:8155` / `:8156` / `:8157` / `:8160` — accessible
-  over Tailscale on the host's `tailscale0` IP. Make sure nothing else
-  on the host is squatting those ports.
-- **Single-slot rule** (the one that bricks the box if ignored):
-  Running more than one heavyweight slot at a time exhausts 128 GB
-  unified memory and triggers an OOM respawn loop documented in
-  [POSTMORTEM.md](reference-previous/POSTMORTEM.md). `docker-llm-switch` enforces this by
-  stopping every other `spark-llm-*` container before starting a new one
-  — so use `./docker/run.sh <slot>` or `docker-llm-switch <slot>`, never
-  raw `docker run`.
-- **Build time**: ~25–40 min on GB10 with `BUILD_JOBS=16`. The default
-  `LLAMA_REF=master` ships mainline llama.cpp (~23 t/s on Qwen3.6-27B).
-  For full perf (~28 t/s), build with `--build-arg LLAMA_REF=<mtp-sha>`
-  pointing at the pre-merge MTP branch the systemd `*.service` files use.
-- **FLUX (imagine) and ComfyUI** are in the Docker path as separate
-  images, built from `docker/sd-server/` and `docker/comfyui/`. Both share
-  the same `--network=host` + bind-mounted-models pattern as the llama
-  slots. ComfyUI additionally bind-mounts `~/comfyui/{custom_nodes,output,user}`
-  so anything you install via the Manager web UI persists across rebuilds.
-- **ComfyUI OOM warning**: ComfyUI on Blackwell unified memory has a
-  known issue (Comfy-Org/ComfyUI#11106) where chaining VAE Decode with
-  Depth nodes can spike past 128 GB in seconds. The image already passes
-  `--disable-pinned-memory` and `--reserve-vram 2.0` to mitigate; if you
-  still hit it, batch in smaller tiles and avoid forcing `--gpu-only`.
-
-### Commands
-
-Run these from the repo root.
-
-```bash
-# 1. Build all three images (llama / sd-server / comfyui). Build context
-#    is the repo root so tools/flux-gen is reachable for the llama image.
-#    Override LLAMA_REF / COMFYUI_REF / SD_REF via --build-arg to pin.
-docker compose -f docker/docker-compose.yml build
-# (or build a single image: `docker compose -f docker/docker-compose.yml build comfyui`)
-
-# 2. Install the container manager on PATH (one-time).
-cp docker/docker-llm-switch ~/.local/bin/
-chmod +x ~/.local/bin/docker-llm-switch
-
-# 3. Start a slot (stops every other spark-llm-* container first).
-./docker/run.sh                  # coder slot (Qwen3.6-27B, :8152)
-./docker/run.sh architect        # architect slot (Qwen3.6-35B, :8154)
-./docker/run.sh gemma            # gemma 31B, :8156
-./docker/run.sh vision           # gemma vision, :8155
-./docker/run.sh gptoss           # gpt-oss-20B, :8157
-./docker/run.sh imagine          # FLUX.2-klein via sd-server, :8160
-./docker/run.sh comfyui          # ComfyUI on :8188
-
-# 4. Manage state
-docker-llm-switch status         # what's running, ports, restart policy
-docker-llm-switch off            # stop everything
-
-# 5. Auto-start a slot on Docker daemon reboot
-docker-llm-switch boot-default architect   # only one slot ever has a policy
-docker-llm-switch boot-status              # show what'll start at daemon boot
-docker-llm-switch boot-safe                # clear all restart policies
-```
-
-### Custom nodes for ComfyUI
-
-The container's `/opt/ComfyUI/custom_nodes/` is a bind mount of
-`~/comfyui/custom_nodes/` on the host. The image seeds ComfyUI-Manager
-into that directory on first run (no-clobber, so anything you've added
-is preserved across restarts and image rebuilds). Install new nodes
-through the Manager web UI or by `git clone`-ing into
-`~/comfyui/custom_nodes/` directly — restart the container to pick them
-up. Workflows / settings live in `~/comfyui/user/`, generated images in
-`~/comfyui/output/`.
-
-### Verifying a build before you trust it
-
-CI runs Dockerfile lint + a Scout base-image CVE scan, but it has no
-GPU and cannot exercise the actual binaries. See
-[`docker/SMOKE-TESTS.md`](docker/SMOKE-TESTS.md) for the manual checklist
-that has to pass on a real GB10 host before changes under `docker/` are
-considered shippable (build, bad-ref regression, mutual exclusion,
-Tailscale reachability, hardening parity, end-to-end FLUX gen, custom-
-node persistence, daemon-restart survival).
-
-First-time HF download example (one-off, fills `~/models/`):
-
-```bash
-docker run --rm --gpus=all --network=host \
-  --memory=80g --memory-swap=80g \
-  --oom-score-adj=200 --ulimit memlock=-1:-1 --shm-size=1g \
-  -v ~/models:/models \
-  -e HUGGING_FACE_HUB_TOKEN="$HUGGING_FACE_HUB_TOKEN" \
-  spark-llm-stack \
-  -hf unsloth/Qwen3.6-27B-MTP-GGUF:UD-Q4_K_XL \
-  --alias qwen3.6-27b-coder --host 0.0.0.0 --port 8152
-```
-
----
-
-## Docker container — what came from where
-
-The `docker/Dockerfile`, `docker/run.sh`, and `docker/docker-llm-switch` were built by synthesising three sources:
-
-### From [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker)
-A vLLM container for the same GB10 hardware that confirmed the right approach before a line was written:
-- **Base image**: `nvidia/cuda:13.2.0-devel-ubuntu24.04` — verified by that repo to work on GB10 aarch64; used verbatim.
-- **Multi-stage build** (builder → runtime) — keeps the final image free of cmake, git, and CUDA headers.
-- **`ARG BUILD_JOBS=16`** with `ENV MAX_JOBS=${BUILD_JOBS}` — parallelism override pattern adopted as-is.
-- **Ninja generator** (`-G Ninja`) — that repo builds all its C++ with Ninja; used here for the llama.cpp build.
-
-That repo does not use Tailscale — it relies on InfiniBand/RoCE for multi-node links. This confirmed that host networking (`--network=host`) is the right and sufficient approach for single-node Tailscale access.
-
-### From this repo's own `.service` files and [`POSTMORTEM.md`](reference-previous/POSTMORTEM.md)
-Every llama.cpp flag, env var, and memory limit came from what was already here:
-- **GB10 cmake flags** (`121a-real`, `GGML_CPU_KLEIDIAI`, `GGML_CUDA_FA_ALL_QUANTS`, `GGML_CUDA_FORCE_MMQ`) — copied verbatim from the README build section.
-- **`CMD` args** in the Dockerfile and `docker-llm-switch` slot tables — translated line-for-line from the `ExecStart` blocks in each `.service` file (`qwen27-mtp.service`, `qwen35-mtp.service`, `gemma-31b.service`, `gemma-vision.service`, `gptoss-20b.service`).
-- **CUDA env vars** (`CUDA_SCALE_LAUNCH_QUEUES=4x`, `GGML_CUDA_GRAPH_OPT=1`, `GGML_CUDA_FORCE_CUBLAS_COMPUTE_16F=1`) — lifted from the `Environment=` lines in every service unit.
-- **Memory caps** — `docker-llm-switch`'s `MEMCAP` and `MEMSOFT` tables map directly to the `MemoryMax` and `MemoryHigh` drop-in values from the POSTMORTEM hardening table. `--rm` (runtime) gives `OOMPolicy=stop` semantics; `--oom-score-adj=200` mirrors `OOMScoreAdjust=200`; `--restart unless-stopped` (boot-default) is the Docker analogue of `WantedBy=default.target`; `stop_all_except` replaces `Conflicts=`.
-- **`--host 0.0.0.0`** (not `127.0.0.1`) — the one deliberate delta from the service files, needed so traffic arriving on the host's `tailscale0` interface reaches the server.
-
-## ComfyUI + FLUX containers — what came from where
-
-`docker/comfyui/` and `docker/sd-server/` were synthesised from this repo's own systemd units (the `ExecStart` for `flux-klein.service` is the authoritative source for the sd-server CMD), plus the following community work on Blackwell aarch64 — none of their images are pulled directly, but their configuration choices are the reason the build works on first try.
-
-### From [AEON-7/comfyui-aeon-spark](https://github.com/AEON-7/comfyui-aeon-spark)
-The most concrete reference for Blackwell-specific tuning:
-- **`TORCH_CUDA_ARCH_LIST=12.1a`** — emit sm_121a SASS specifically, not generic Blackwell PTX. Adopted in `docker/comfyui/Dockerfile`.
-- **SageAttention compile flags** (`-gencode=arch=compute_121a,code=sm_121a` via `NVCC_APPEND_FLAGS`) — the only working fast-attention path on GB10; FlashAttention 2/3 has no aarch64 sm_121 wheels. Used verbatim in the SageAttention build step.
-- **`TORCH_COMPILE_DISABLE=1`** — torch.compile emits broken SASS for sm_121a on PyTorch 2.9.x. Set as ENV in both build and runtime stages.
-- **`CUDA_MANAGED_FORCE_DEVICE_ALLOC=1` + `PYTORCH_ALLOC_CONF=expandable_segments:True`** — Grace unified-memory tuning; lifted from their docker-compose env block.
-- **`--disable-pinned-memory --reserve-vram 2.0`** ComfyUI CLI flags — community-confirmed workaround for the Grace coherence issues. Applied as the default CMD.
-
-### From [luix93/DGX-Spark-ComfyUI](https://github.com/luix93/DGX-Spark-ComfyUI)
-- **`/opt/venv` virtualenv pattern** — copy a fully-resolved venv from the builder stage rather than running pip in the runtime stage. Cleaner final image; adopted.
-- **PyTorch source**: official cu130 wheels from `https://download.pytorch.org/whl/cu130`, NOT NGC wheels (NGC lags in sm_121a PTX). Locked to `torch==2.9.1+cu130` in `docker/comfyui/Dockerfile`.
-
-### From [mmartial/ComfyUI-Nvidia-Docker](https://github.com/mmartial/ComfyUI-Nvidia-Docker)
-- **ComfyUI-Manager auto-bootstrap pattern** — bake a default copy of ComfyUI-Manager into the image at a path *outside* the bind-mount target (`/opt/comfy-defaults/`), seeded into `/opt/ComfyUI/custom_nodes/` on first run via a small entrypoint script. Without this, a bind-mounted empty host directory shadows the in-image ComfyUI-Manager and the user has to install it by hand. See `docker/comfyui/entrypoint.sh`.
-- **`HF_HUB_ENABLE_HF_TRANSFER=1`** — faster model downloads when grabbing weights from inside the container.
-
-### From the NVIDIA Developer forums + [comfyanonymous/ComfyUI#11106](https://github.com/comfyanonymous/ComfyUI/issues/11106)
-- **Documented mitigations** for the Grace unified-memory VAE-Decode spike (chained VAE Decode + Depth can spike past 128 GB in seconds). Our defaults match the community workaround; the README "Before you begin" section flags the issue so the user has a pointer when they hit it.
-- **CUDA 13.x is mandatory** for sm_121 support; CUDA 12.x maxes out at sm_120 and won't work. Already baked in via the existing `nvidia/cuda:13.2.0` base image.
-
-### What we deliberately did NOT take
-
-- **Pre-bundled custom-node packs** (AEON-7 ships 14 node repos; luix93 ships several) — we ship only ComfyUI-Manager and let the user install what they actually need via the web UI. Image stays smaller, no version-lock surprises.
-- **Pre-staged model weights** (AEON-7 ships ~285 GB of FLUX/SDXL/LoRA bundles) — models live on the host at `~/models/`, bind-mounted in. Image stays small, weights are not duplicated.
-- **NGC `nvcr.io/nvidia/cuda`** base images — Docker Hub `nvidia/cuda:13.2.0` works the same and matches the existing llama Dockerfile, so layer cache is shared.
-- **`docker-compose` as runtime orchestrator** — we use compose for builds only; runtime (mutual exclusion, boot-default, status, wait_ready) stays in `docker-llm-switch` so the systemd and Docker paths have the same UX.
+See **[`docker/README.md`](docker/README.md)** for the full Docker path:
+model downloads, build commands, slot roster, state management, ComfyUI
+custom nodes, FLUX model files, smoke tests, and provenance.
 
 ---
 
@@ -480,8 +382,9 @@ systemctl --user daemon-reload
 cp systemd/llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/llm-switch
 cp tools/flux-gen ~/.local/bin/ && chmod +x ~/.local/bin/flux-gen
 
-# (Optional) Docker path — install the container manager
-cp docker/docker-llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/docker-llm-switch
+# (Optional) Docker path — symlink keeps it live with repo edits
+ln -sf "$(pwd)/docker/docker-llm-switch" ~/.local/bin/docker-llm-switch
+chmod +x "$(pwd)/docker/docker-llm-switch"
 ```
 
 ---
@@ -580,7 +483,65 @@ bash systemd/harden-llm-stack.sh --revert # remove all drop-ins
 |---|---|---|
 | `--no-mmap` | **removed** | Anonymous pages can't be evicted on unified memory. Page cache is safer. |
 | `--mlock` | **removed** | Pins entire model permanently, starves other services. |
-| `-c 262144` | optional | Lower to `131072` for typical tasks; 256K context is rarely needed. |
+| `-c 131072` | **default** (128K) | Lowered from 262144 (256K) to halve KV-cache footprint. See "Tuning context + concurrency" below for how to bump back. |
+| `--parallel 1` | **default** | Memory-safe at 128K context (`--parallel 2` would fit, but doubles concurrent KV slots). See "Tuning context + concurrency" below. |
+
+### Tuning context + concurrency
+
+The defaults assume one heavy slot, one user at a time, ≤128K tokens of
+context. Two knobs commonly want tuning. Each lives in two mirrored
+files per slot — change both, then reload.
+
+Each slot has its values mirrored in two files: a per-slot
+`systemd/units/<slot>.service` (`sed` is safe here) AND a shared
+`docker/docker-llm-switch` with **one `CMD_<slot>=( ... )` block per
+slot** (manual edit — every block contains the same `-c 131072` /
+`--parallel 1`, so a blind `sed -i` would flip all five).
+
+| Slot | systemd unit | docker-llm-switch block |
+|---|---|---|
+| coder | `systemd/units/qwen27-mtp.service` | `CMD_coder=(...)` |
+| architect | `systemd/units/qwen35-mtp.service` | `CMD_architect=(...)` |
+| gemma | `systemd/units/gemma-31b.service` | `CMD_gemma=(...)` |
+| vision | `systemd/units/gemma-vision.service` | `CMD_vision=(...)` |
+| gptoss | `systemd/units/gptoss-20b.service` | `CMD_gptoss=(...)` |
+
+**Bump a slot's context window back to 256K** (example: coder)
+```bash
+# 1a. Edit the systemd unit (single value, sed-safe).
+sed -i 's/-c 131072/-c 262144/' systemd/units/qwen27-mtp.service
+# 1b. Hand-edit docker/docker-llm-switch: inside the CMD_coder=(...) block,
+#     change the "-c 131072" token to "-c 262144" (leave -ngl 999 -fa on intact).
+$EDITOR docker/docker-llm-switch
+
+# 2. Reload + restart.
+systemctl --user daemon-reload && llm-switch coder
+# Docker path: docker-llm-switch coder (recreates container with new CMD)
+```
+KV-cache impact at `q8_0/q8_0`: ~24 GB at 128K → ~48 GB at 256K. Still
+fits the 80 G `MemoryMax`. **Do not** also enable `--parallel 2` on
+the same slot — combined cost is ~96 GB and busts the cap.
+
+**Enable `--parallel 2` on a slot (concurrent requests)** (example: coder)
+```bash
+# 1a. Edit the systemd unit.
+sed -i 's/--parallel 1/--parallel 2/' systemd/units/qwen27-mtp.service
+# 1b. Hand-edit docker/docker-llm-switch: inside the CMD_coder=(...) block,
+#     change "--parallel 1" to "--parallel 2".
+$EDITOR docker/docker-llm-switch
+
+# 2. Reload + restart.
+systemctl --user daemon-reload && llm-switch coder
+```
+Doubles concurrent request capacity at 128K context (~48 GB total KV
+under the 80 G cap). Caveat: each in-flight request shares the slot's
+compute pool — two concurrent users see roughly half the per-request
+throughput. Enable only when concurrency matters more than single-user
+latency.
+
+**Reverting either change** is the same edit in reverse, then
+`daemon-reload` + slot restart. Both knobs are tracked in
+[`docs/architecture/DECISIONS.md`](docs/architecture/DECISIONS.md) §11.
 
 ### Pre-reboot checklist
 

@@ -1,3 +1,6 @@
+# Threading (--threads 16 / --threads-batch 24) and the absence of --parallel
+# >1 are explained in docs/architecture/DECISIONS.md §10 + §11.
+
 [Unit]
 Description=Gemma4 31B Alt Architect on 8156
 After=network-online.target
@@ -16,7 +19,7 @@ ExecStart=/home/radek/src/llama.cpp-mtp/build/bin/llama-server \
   --port 8156 \
   -ngl 999 \
   -fa on \
-  -c 262144 \
+  -c 131072 \
   --cache-type-k q8_0 \
   --cache-type-v q8_0 \
   --kv-unified \
@@ -27,10 +30,8 @@ ExecStart=/home/radek/src/llama.cpp-mtp/build/bin/llama-server \
   -b 16384 \
   -ub 4096 \
   --parallel 1 \
-  --threads 8 \
-  --cpu-range 0-9 \
-  --threads-batch 16 \
-  --cpu-range-batch 10-19 \
+  --threads 16 \
+  --threads-batch 24 \
   --threads-http 4 \
   --prio 2 \
   --poll 50 \

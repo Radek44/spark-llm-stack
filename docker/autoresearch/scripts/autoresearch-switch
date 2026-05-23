@@ -1,11 +1,92 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# readlink -f dereferences symlinks so the script can be symlinked into
+# ~/.local/bin while ROOT_DIR still resolves to the actual repo checkout.
+ROOT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../../.." && pwd)"
 COMPOSE_FILE="$ROOT_DIR/docker/autoresearch/docker-compose.autoresearch.yml"
 ENV_FILE="$ROOT_DIR/.env.autoresearch"
 
 SERVICES=(karpathy dgx nauto-orch nauto-worker gemini autokernel)
+
+# Source operator-tuned memory caps so projected_cap_gb sees them. Without
+# this the shell only knows the hardcoded fallbacks below, even though
+# `compose --env-file` passes them through to docker — leading admission to
+# under-/over-estimate when .env.autoresearch overrides defaults.
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+# ── cross-stack failsafe library (docker/lib/spark-mem.sh) ────────────────────
+#
+# Provides: spark_acquire_lock, spark_admission_check,
+# spark_cross_stack_stop_others, spark_drop_caches, spark_panic_stop_all,
+# spark_parse_gb. See docker/lib/spark-mem.sh for rationale and details.
+#
+# Lookup order: $SPARK_MEM_LIB env override → repo-relative → /usr/local/lib.
+# If the lib can't be found we install conservative no-op shims so this script
+# still works on a host where the failsafe install step hasn't been run yet.
+SPARK_MEM_LIB="${SPARK_MEM_LIB:-$ROOT_DIR/docker/lib/spark-mem.sh}"
+if [ ! -r "$SPARK_MEM_LIB" ]; then
+  for _cand in /usr/local/lib/spark-mem.sh /etc/spark-llm-stack/spark-mem.sh; do
+    [ -r "$_cand" ] && SPARK_MEM_LIB="$_cand" && break
+  done
+fi
+if [ -r "$SPARK_MEM_LIB" ]; then
+  # shellcheck source=../../lib/spark-mem.sh
+  . "$SPARK_MEM_LIB"
+else
+  echo "autoresearch-switch: warning — spark-mem.sh not found; failsafe shims active" >&2
+  spark_acquire_lock() { :; }
+  spark_admission_check() { return 0; }
+  spark_cross_stack_stop_others() { :; }
+  spark_drop_caches() {
+    sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || {
+      echo "autoresearch-switch: drop_caches shim skipped (no passwordless sudo)" >&2
+      return 0
+    }
+  }
+  spark_panic_stop_all() {
+    echo "spark-panic shim: stopping every spark-* docker container" >&2
+    docker ps -q --filter "name=spark-" | xargs -r docker stop -t 10 >/dev/null 2>&1 || true
+  }
+  spark_parse_gb() {
+    # Mirror the real library's parser (docker/lib/spark-mem.sh) so the shim
+    # behaves identically when the lib is absent — otherwise an m/k-scale
+    # value in .env.autoresearch silently parses to 0 here, while the real
+    # lib would handle it.
+    local raw="${1:-0}"
+    raw=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+    case "$raw" in
+      ''|0) echo 0 ;;
+      *gb|*g) echo "${raw%%g*}" ;;
+      *mb|*m) echo $(( ${raw%%m*} / 1024 )) ;;
+      *kb|*k) echo $(( ${raw%%k*} / 1048576 )) ;;
+      *[!0-9]*) echo 0 ;;
+      *) echo $(( raw / 1073741824 )) ;;
+    esac
+  }
+fi
+
+# Memory cap (GiB) projected for each autoresearch profile. Mirrors the values
+# in .env.autoresearch; if the env var is set (loaded by docker compose
+# --env-file) we use that, otherwise fall back to the documented default.
+projected_cap_gb() {
+  local svc="$1" cap=""
+  case "$svc" in
+    karpathy)     cap="${KARPATHY_MEM_LIMIT:-60g}" ;;
+    dgx)          cap="${DGX_MEM_LIMIT:-80g}" ;;
+    nauto-orch)   cap="${NAUTO_ORCH_MEM_LIMIT:-40g}" ;;
+    nauto-worker) cap="${NAUTO_WORKER_MEM_LIMIT:-80g}" ;;
+    gemini)       cap="${GEMINI_MEM_LIMIT:-8g}" ;;
+    autokernel)   cap="${AUTOKERNEL_MEM_LIMIT:-70g}" ;;
+    *)            cap="40g" ;;
+  esac
+  spark_parse_gb "$cap"
+}
 
 compose() {
   if [ -f "$ENV_FILE" ]; then
@@ -39,15 +120,40 @@ cmd_start() {
   fi
 
   echo "→ starting '$svc' (mutually exclusive mode)"
+
+  # Layer 1 of the cross-stack failsafe: acquire the shared mutex so a
+  # concurrent docker-llm-switch invocation can't race this one.
+  spark_acquire_lock || exit 1
+
+  # Intra-stack: stop other autoresearch profiles (existing behaviour).
   stop_all_except "$svc"
-  # Flush Linux page/dentry/inode cache before launch.
-  # On DGX Spark unified memory the buffer cache can hold 8–20 GB after
-  # prior workloads; without this flush the effective working headroom is
-  # smaller than `free -h` suggests.
-  echo "→ flushing buffer cache (reclaims 8–20 GB of DGX Spark unified memory)"
-  sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+
+  # Flush BEFORE admission so the check sees post-flush MemAvailable —
+  # otherwise a marginal workload that would have fit after reclaim is
+  # incorrectly rejected (and triggers a spurious cross-stack eviction).
+  # Same ordering on docker-llm-switch for symmetry across stacks.
+  spark_drop_caches
+
+  # Cross-stack admission gate. If the projected cap fits within
+  # MemAvailable - HEADROOM (default 8 GiB), let other-stack containers run
+  # alongside this one. Otherwise force-stop the cross-stack set.
+  local target_container="spark-autoresearch-$svc"
+  local projected_gb
+  projected_gb=$(projected_cap_gb "$svc")
+
+  if ! spark_admission_check "$projected_gb"; then
+    echo "→ insufficient memory for $svc (${projected_gb}GiB cap exceeds headroom); stopping cross-stack containers"
+    spark_cross_stack_stop_others "$target_container"
+  else
+    echo "→ admission ok: ${projected_gb}GiB fits without disturbing other-stack containers"
+  fi
+
   compose up -d --build "$svc"
   cmd_status
+}
+
+cmd_panic() {
+  spark_panic_stop_all
 }
 
 cmd_off() {
@@ -90,6 +196,9 @@ case "${1:-status}" in
   bootstrap)
     cmd_bootstrap
     ;;
+  panic)
+    cmd_panic
+    ;;
   help|-h|--help)
     cat <<USAGE
 autoresearch-switch
@@ -100,6 +209,10 @@ Commands:
   autoresearch-switch off
   autoresearch-switch status
   autoresearch-switch logs <karpathy|dgx|nauto-orch|nauto-worker|gemini|autokernel>
+  autoresearch-switch panic     emergency cross-stack stop (BOTH stacks);
+                                stops every container with label
+                                spark.exclusive=true, clears restart policies,
+                                drops page cache. Idempotent.
 USAGE
     ;;
   *)
