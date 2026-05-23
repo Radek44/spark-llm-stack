@@ -348,6 +348,11 @@ print('Done')
 "
 ```
 
+Notes:
+- `hf` replaces the deprecated `huggingface-cli`; both come from `pip install huggingface_hub[cli]` but older installs may still have only the old name.
+- `--local-dir-use-symlinks` was removed in newer `huggingface_hub` releases — `--local-dir` now always copies files directly.
+- The merge step needs `safetensors` + `torch`, which live in `~/jupyterlab/.venv`, not the system Python.
+
 ---
 
 ## Installation
