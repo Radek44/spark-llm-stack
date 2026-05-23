@@ -24,37 +24,23 @@ For the autoresearch launcher see [`autoresearch/README.md`](autoresearch/README
 
 Models live on the host at `~/models/` and are bind-mounted into containers at `/models`.
 
+### Download all llama models at once (~61 GB total)
+
 ```bash
 mkdir -p ~/models
 
-# Coder — Qwen3.6-27B dense (~17 GB) — recommended first
-# NOTE: "MTP" appears only in the repo name, not the filename inside it.
-hf download unsloth/Qwen3.6-27B-MTP-GGUF \
-  Qwen3.6-27B-UD-Q4_K_XL.gguf \
-  --local-dir ~/models
-
-# Architect — Qwen3.6-35B-A3B MoE (~22 GB)
-# NOTE: same pattern — MTP in repo name only, not filename.
-hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF \
-  Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-  --local-dir ~/models
-
-# Gemma 31B — alt reasoning + image input (~19 GB)
-hf download unsloth/gemma-4-31B-it-GGUF \
-  gemma-4-31B-it-UD-Q4_K_XL.gguf \
-  --local-dir ~/models
-
-# Gemma vision 4B — fast vision + audio (~3 GB)
-hf download unsloth/gemma-4-E4B-it-GGUF \
-  gemma-4-E4B-it-UD-Q4_K_XL.gguf \
-  --local-dir ~/models
+# NOTE: "MTP" appears in HuggingFace repo names but NOT in the filenames inside.
+hf download unsloth/Qwen3.6-27B-MTP-GGUF  Qwen3.6-27B-UD-Q4_K_XL.gguf      --local-dir ~/models  # coder     ~17 GB
+hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --local-dir ~/models  # architect ~22 GB
+hf download unsloth/gemma-4-31B-it-GGUF    gemma-4-31B-it-UD-Q4_K_XL.gguf   --local-dir ~/models  # gemma     ~19 GB
+hf download unsloth/gemma-4-E4B-it-GGUF    gemma-4-E4B-it-UD-Q4_K_XL.gguf   --local-dir ~/models  # vision    ~3 GB
 ```
 
 Notes:
 - `gptoss` uses `--gpt-oss-20b-default` — a built-in flag in the MTP llama.cpp
   binary; no GGUF download needed.
 - `hf` is the HuggingFace CLI. Install with: `pip install huggingface_hub[cli]`
-- For FLUX/imagine model files see the [FLUX section](#flux2-klein-model-files) below.
+- For FLUX/imagine model files (~17 GB) see the [FLUX section](#flux2-klein-model-files) below.
 
 ---
 
