@@ -106,16 +106,73 @@ docker-llm-switch boot-safe               # clear all restart policies
 
 ---
 
-## Custom nodes for ComfyUI
+## ComfyUI installation (Docker path)
 
-`~/comfyui/custom_nodes/` on the host is bind-mounted into the container. On
-every start the entrypoint seeds ComfyUI-Manager via `cp -rn` (no-clobber), so
-it's available immediately without clobbering anything you've added. Install
-additional nodes through the Manager web UI or by `git clone`-ing into
+Everything is already wired up. The image builds from `docker/comfyui/Dockerfile`.
+
+**1. Build the image**
+
+```bash
+# From repo root
+docker compose -f docker/docker-compose.yml build comfyui
+```
+
+This takes a while — it compiles SageAttention from source with `sm_121a` SASS.
+
+**2. Put your models in `~/models/`**
+
+ComfyUI expects the standard subdirectory layout inside its `models/` folder.
+The container bind-mounts `~/models` → `/opt/ComfyUI/models`:
+
+```
+~/models/
+  checkpoints/   ← diffusion models (.safetensors)
+  vae/
+  clip/
+  loras/
+  ...
+```
+
+**3. Start it**
+
+```bash
+docker-llm-switch comfyui
+# or: ./docker/run.sh comfyui
+```
+
+First model load takes 60–90 s — the `wait_ready` loop polls `/system_stats`
+and prints dots until ready. Access at `http://localhost:8188`.
+
+**4. Custom nodes persist automatically**
+
+The entrypoint seeds ComfyUI-Manager into `~/comfyui/custom_nodes/` on first
+run (using `cp -n` so existing nodes are never clobbered). Three bind-mounts
+survive image rebuilds:
+
+```
+~/comfyui/custom_nodes/  ↔  /opt/ComfyUI/custom_nodes
+~/comfyui/output/        ↔  /opt/ComfyUI/output
+~/comfyui/user/          ↔  /opt/ComfyUI/user
+```
+
+Install new nodes through the Manager web UI or by `git clone`-ing into
 `~/comfyui/custom_nodes/` and restarting the container.
 
-- Workflows / settings: `~/comfyui/user/`
-- Generated images: `~/comfyui/output/`
+**GB10-specific notes**
+
+- The `model_management.py` patch in the Dockerfile replaces `cudaMemGetInfo()`
+  with `psutil.virtual_memory().available`. On GB10's unified memory, CUDA's
+  query can report ~6 GB free when 40+ GB are actually available (it sees
+  another process's reservation, not the physical pool). Without the patch,
+  ComfyUI would partially offload models unnecessarily.
+- SageAttention is pinned to v2.2.0 (not v3) — v3 produces mosaic artifacts
+  on GB10 (thu-ml/SageAttention#321). FlashAttention 2/3 has no working
+  aarch64 wheel for SM 12.1 at all.
+
+**Env overrides**
+
+`COMFY_DIR` defaults to `~/comfyui`, `MODELS_DIR` to `~/models`. Both can be
+overridden if your layout differs.
 
 ---
 
