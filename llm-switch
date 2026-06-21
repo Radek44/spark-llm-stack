@@ -1,52 +1,53 @@
 #!/usr/bin/env bash
-# llm-switch v2 — model roster for DGX Spark GB10
-# Adds boot-state management on top of v1's runtime mutual exclusion.
-#
-# Runtime commands (same as v1):
-#   llm-switch [coder|architect|gemma|vision|imagine|gptoss|comfyui]
-#   llm-switch both
+# llm-switch v4 — lean DGX Spark AI service switcher
+# Runtime:
+#   llm-switch [fast_local|small_coder|imagine|comfyui|litellm]
 #   llm-switch off
 #   llm-switch status
-#
-# Boot-state commands (NEW):
-#   llm-switch boot-safe              disable ALL model services from auto-starting at boot
-#   llm-switch boot-default <slot>    set one slot to auto-start at boot (disables others)
-#   llm-switch boot-status            show which slot, if any, will auto-start at boot
+# Boot:
+#   llm-switch boot-safe
+#   llm-switch boot-router
+#   llm-switch boot-default <slot> [--force-heavy]
+#   llm-switch boot-status
 
 set -euo pipefail
 
+SLOTS=(fast_local small_coder imagine comfyui litellm)
+MODEL_SLOTS=(fast_local small_coder imagine comfyui)
+
 declare -A SVCS=(
-  [coder]="qwen27-mtp.service"
-  [architect]="qwen35-mtp.service"
-  [gemma]="gemma-31b.service"
-  [vision]="gemma-vision.service"
+  [fast_local]="vllm-qwen36-35b-nvfp4.service"
+  [small_coder]="gemma4-v2-coder.service"
   [imagine]="flux-klein.service"
-  [gptoss]="gptoss-20b.service"
   [comfyui]="comfyui.service"
+  [litellm]="litellm.service"
 )
 declare -A PORTS=(
-  [coder]=8152 [architect]=8154 [gemma]=8156
-  [vision]=8155 [imagine]=8160 [gptoss]=8157 [comfyui]=8188
+  [fast_local]=8170 [small_coder]=8190 [imagine]=8160 [comfyui]=8188 [litellm]=8180
 )
 declare -A ROLES=(
-  [coder]="qwen3.6-27B    fast coding, MTP 70%+"
-  [architect]="qwen3.6-35B    deep reasoning, MoE"
-  [gemma]="gemma4-31B     alt reasoning + image input"
-  [vision]="gemma4-E4B     fast vision + audio input"
-  [imagine]="flux.2-klein   image generation"
-  [gptoss]="gpt-oss-20B    fast general, OpenAI style"
-  [comfyui]="ComfyUI        diffusion UI + workflows"
+  [fast_local]="vLLM Qwen3.6-35B NVFP4 default local agent"
+  [small_coder]="llama.cpp Gemma4 12B v2 coding subagent experiment"
+  [imagine]="FLUX.2-klein direct image generation"
+  [comfyui]="ComfyUI diffusion workflows"
+  [litellm]="LiteLLM local routing gateway"
+)
+declare -A MIN_MEM_KIB=(
+  [fast_local]=90000000
+  [small_coder]=45000000
+  [imagine]=12000000
+  [comfyui]=30000000
+  [litellm]=2000000
 )
 WAIT_TIMEOUT=300
-
-# ---------- runtime helpers ----------
 
 wait_ready() {
   local slot=$1 port=${PORTS[$1]} elapsed=0
   echo -n "  waiting for $slot on :$port"
-  while ! curl -sf http://127.0.0.1:$port/health > /dev/null 2>&1 \
-      && ! curl -sf http://127.0.0.1:$port/sdcpp/v1/capabilities > /dev/null 2>&1 \
-      && ! curl -sf http://127.0.0.1:$port/ > /dev/null 2>&1; do
+  while ! curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1 \
+      && ! curl -sf "http://127.0.0.1:$port/v1/models" > /dev/null 2>&1 \
+      && ! curl -sf "http://127.0.0.1:$port/sdcpp/v1/capabilities" > /dev/null 2>&1 \
+      && ! curl -sf "http://127.0.0.1:$port/" > /dev/null 2>&1; do
     sleep 2; elapsed=$((elapsed+2)); echo -n "."
     [ $elapsed -ge $WAIT_TIMEOUT ] && { echo " TIMEOUT"; exit 1; }
   done
@@ -56,9 +57,20 @@ wait_ready() {
 svc_running() { systemctl --user is-active "$1" > /dev/null 2>&1; }
 svc_enabled() { systemctl --user is-enabled "$1" 2>/dev/null | grep -qx enabled; }
 
-stop_all_except() {
+require_memory() {
+  local slot="$1" min="${MIN_MEM_KIB[$slot]:-0}" avail
+  avail=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+  if (( avail < min )); then
+    echo "  refusing to start $slot: MemAvailable ${avail} KiB < required ${min} KiB" >&2
+    free -h
+    echo "  stop other services first with: llm-switch off" >&2
+    exit 1
+  fi
+}
+
+stop_all_models_except() {
   local keep="$1"
-  for slot in "${!SVCS[@]}"; do
+  for slot in "${MODEL_SLOTS[@]}"; do
     local svc="${SVCS[$slot]}"
     if [ "$svc" != "$keep" ] && svc_running "$svc"; then
       echo "  stopping $slot..."
@@ -70,62 +82,77 @@ stop_all_except() {
 
 show_status() {
   echo ""
-  printf "  %-10s %-28s %-10s %-9s %s\n" "slot" "service" "state" "at-boot" "role"
-  printf "  %-10s %-28s %-10s %-9s %s\n" "──────────" "──────────────────────────" "─────────" "─────────" "──────────────────────────────"
-  for slot in coder architect gemma vision imagine gptoss comfyui; do
-    local svc="${SVCS[$slot]}"
-    local port="${PORTS[$slot]}"
-    local state boot
-    state=$(systemctl --user is-active  "$svc" 2>/dev/null) || true
-    boot=$(systemctl  --user is-enabled "$svc" 2>/dev/null) || true
+  printf "  %-12s %-36s %-10s %-9s %s\n" "slot" "service" "state" "at-boot" "role"
+  printf "  %-12s %-36s %-10s %-9s %s\n" "────────────" "────────────────────────────────────" "─────────" "─────────" "──────────────────────────────"
+  for slot in "${SLOTS[@]}"; do
+    local svc="${SVCS[$slot]}" port="${PORTS[$slot]}" state boot
+    state=$(systemctl --user is-active "$svc" 2>/dev/null) || true
+    boot=$(systemctl --user is-enabled "$svc" 2>/dev/null) || true
     [ -z "$state" ] && state="unknown"
-    [ -z "$boot" ]  && boot="missing"
-    printf "  %-10s %-28s %-10s %-9s %s\n" "$slot" "$svc (:$port)" "$state" "$boot" "${ROLES[$slot]}"
+    [ -z "$boot" ] && boot="missing"
+    printf "  %-12s %-36s %-10s %-9s %s\n" "$slot" "$svc (:$port)" "$state" "$boot" "${ROLES[$slot]}"
   done
   echo ""
   free -h | awk '/Mem:/{printf "  memory: %s used / %s total / %s available\n", $3, $2, $7}'
+  free -h | awk '/Swap:/{printf "  swap:   %s used / %s total / %s free\n", $3, $2, $4}'
   echo ""
 }
 
-# ---------- boot-state helpers (NEW) ----------
-
 boot_safe() {
-  echo "→ disabling all model services from auto-start at boot"
-  for slot in "${!SVCS[@]}"; do
+  echo "→ disabling all managed services from auto-start at boot"
+  for slot in "${SLOTS[@]}"; do
     local svc="${SVCS[$slot]}"
     if svc_enabled "$svc"; then
       echo "  disabling $slot ($svc)..."
       systemctl --user disable "$svc"
     fi
   done
-  echo "  done. all model services are now manual-start only."
-  echo "  (existing running services were NOT stopped — use 'llm-switch off' for that.)"
+  echo "  done. all managed services are manual-start only."
   boot_status
+}
+
+boot_router() {
+  echo "→ safe boot mode: enable LiteLLM router only; keep heavyweight model/media services manual"
+  for slot in "${SLOTS[@]}"; do
+    local svc="${SVCS[$slot]}"
+    if [ "$slot" = "litellm" ]; then
+      svc_enabled "$svc" || systemctl --user enable "$svc"
+    else
+      svc_enabled "$svc" && systemctl --user disable "$svc"
+    fi
+  done
+  boot_status
+}
+
+is_model_slot() {
+  local needle="$1"
+  for slot in "${MODEL_SLOTS[@]}"; do
+    [ "$slot" = "$needle" ] && return 0
+  done
+  return 1
 }
 
 boot_default() {
   local slot="$1"
   if [ -z "${SVCS[$slot]:-}" ]; then
     echo "unknown slot: $slot" >&2
-    echo "valid: ${!SVCS[*]}" >&2
+    echo "valid: ${SLOTS[*]}" >&2
+    exit 1
+  fi
+  if is_model_slot "$slot" && [ "${2:-}" != "--force-heavy" ]; then
+    echo "refusing to auto-start heavyweight slot '$slot' at boot without --force-heavy" >&2
+    echo "safe default: llm-switch boot-router" >&2
+    echo "explicit override: llm-switch boot-default $slot --force-heavy" >&2
     exit 1
   fi
   local keep="${SVCS[$slot]}"
-  echo "→ setting $slot as boot default (and disabling all others at boot)"
-  for s in "${!SVCS[@]}"; do
+  echo "→ setting $slot as boot default and disabling all others"
+  for s in "${SLOTS[@]}"; do
     local svc="${SVCS[$s]}"
     if [ "$svc" = "$keep" ]; then
-      if ! svc_enabled "$svc"; then
-        echo "  enabling $s ($svc) for auto-start..."
-        systemctl --user enable "$svc"
-      else
-        echo "  $s already enabled"
-      fi
+      svc_enabled "$svc" || systemctl --user enable "$svc"
     else
-      if svc_enabled "$svc"; then
-        echo "  disabling $s ($svc)..."
-        systemctl --user disable "$svc"
-      fi
+      svc_enabled "$svc" && systemctl --user disable "$svc"
     fi
   done
   boot_status
@@ -134,7 +161,7 @@ boot_default() {
 boot_status() {
   echo ""
   local any=0
-  for slot in coder architect gemma vision imagine gptoss comfyui; do
+  for slot in "${SLOTS[@]}"; do
     local svc="${SVCS[$slot]}"
     if svc_enabled "$svc"; then
       printf "  auto-start at boot: %s (%s)\n" "$slot" "$svc"
@@ -142,21 +169,22 @@ boot_status() {
     fi
   done
   if [ "$any" = "0" ]; then
-    echo "  no model service will auto-start at boot. (good — manual via llm-switch only.)"
+    echo "  no managed service will auto-start at boot."
   fi
   echo ""
 }
 
-# ---------- dispatcher ----------
-
 CMD="${1:-status}"
 
 case "$CMD" in
-  coder|architect|gemma|vision|imagine|gptoss|comfyui)
+  fast_local|small_coder|imagine|comfyui|litellm)
     target_svc="${SVCS[$CMD]}"
     echo "→ $CMD mode (${ROLES[$CMD]})"
-    stop_all_except "$target_svc"
+    if [ "$CMD" != "litellm" ]; then
+      stop_all_models_except "$target_svc"
+    fi
     if ! svc_running "$target_svc"; then
+      require_memory "$CMD"
       systemctl --user start "$target_svc"
       wait_ready "$CMD"
     else
@@ -164,20 +192,9 @@ case "$CMD" in
     fi
     show_status
     ;;
-  both)
-    echo "→ coder + architect"
-    echo "  WARNING: two heavyweight models simultaneously. Check 'free -h' first."
-    for slot in coder architect; do
-      if ! svc_running "${SVCS[$slot]}"; then
-        systemctl --user start "${SVCS[$slot]}"
-        wait_ready "$slot"
-      fi
-    done
-    show_status
-    ;;
   off)
-    echo "→ stopping all"
-    for slot in "${!SVCS[@]}"; do
+    echo "→ stopping model/media services"
+    for slot in "${MODEL_SLOTS[@]}"; do
       systemctl --user stop "${SVCS[$slot]}" 2>/dev/null || true
     done
     sleep 3; show_status
@@ -188,34 +205,36 @@ case "$CMD" in
   boot-safe)
     boot_safe
     ;;
+  boot-router)
+    boot_router
+    ;;
   boot-default)
-    if [ -z "${2:-}" ]; then
-      echo "usage: llm-switch boot-default <slot>" >&2
-      echo "valid slots: ${!SVCS[*]}" >&2
-      exit 1
-    fi
-    boot_default "$2"
+    [ -n "${2:-}" ] || { echo "usage: llm-switch boot-default <slot> [--force-heavy]" >&2; echo "valid: ${SLOTS[*]}" >&2; exit 1; }
+    boot_default "$2" "${3:-}"
     ;;
   boot-status)
     boot_status
     ;;
   -h|--help|help)
     cat <<EOF
-llm-switch v2 — model roster for DGX Spark GB10
+llm-switch v4 — lean DGX Spark AI service switcher
 
 Runtime:
-  llm-switch <slot>          start one slot (stops all others)
-  llm-switch both            start coder + architect together (risky)
-  llm-switch off             stop everything
-  llm-switch status          show current state
+  llm-switch fast_local    start vLLM local LLM service
+  llm-switch small_coder   start Gemma4 12B v2 coding-specialist service
+  llm-switch litellm       start LiteLLM router without stopping models
+  llm-switch imagine       start FLUX.2-klein direct image service
+  llm-switch comfyui       start ComfyUI
+  llm-switch off           stop model/media services, leave LiteLLM alone
+  llm-switch status        show current state and memory
 
 Boot:
-  llm-switch boot-safe       disable all from auto-starting at boot
-  llm-switch boot-default <slot>
-                             enable ONE slot for auto-start (disables others)
-  llm-switch boot-status     show what will auto-start at boot
+  llm-switch boot-safe
+  llm-switch boot-router     safe boot: LiteLLM only; models stay manual
+  llm-switch boot-default <slot> [--force-heavy]
+  llm-switch boot-status
 
-Slots: ${!SVCS[*]}
+Slots: ${SLOTS[*]}
 EOF
     ;;
   *)

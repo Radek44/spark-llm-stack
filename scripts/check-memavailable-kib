@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+required="${1:?usage: check-memavailable-kib <required-kib>}"
+avail=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+if (( avail < required )); then
+  echo "MemAvailable ${avail} KiB < required ${required} KiB; refusing heavyweight model start" >&2
+  free -h >&2
+  exit 1
+fi

@@ -1,27 +1,42 @@
 # Hermes provider config for spark-llm-stack
-# Add these providers to ~/.hermes/config.yaml
+# Preferred path: Hermes -> LiteLLM localhost gateway -> local/cloud aliases.
+# Add this provider to ~/.hermes/config.yaml after LiteLLM and vLLM are tested.
+# Do not store API keys in this repo.
+
+model:
+  provider: local-litellm
+  model: fast_local
+  base_url: http://127.0.0.1:8180/v1
 
 providers:
-  local-coder-mtp:
-    api: http://127.0.0.1:8152/v1
-    default_model: qwen3.6-27b-mtp-coder
-    name: Coder - Qwen3.6 27B Dense
+  local-litellm:
+    api: http://127.0.0.1:8180/v1
+    default_model: fast_local
+    name: Local LiteLLM Router
     models:
-    - qwen3.6-27b-mtp-coder
+    - fast_local
+    - private_local
+    - small_coder
+    # Optional future local routes:
+    # - nemotron_local
+    # - coder_local
+    # Optional explicit cloud/API routes if configured in LiteLLM:
+    # - code_frontier
+    # - claude_frontier
     extra_body:
-      max_tokens: 4096
-      temperature: 0.6
+      max_tokens: 16384
+      temperature: 0.7
       top_p: 0.95
-      top_k: 20
 
-  local-agent-mtp:
-    api: http://127.0.0.1:8154/v1
-    default_model: qwen3.6-35b-a3b-mtp
-    name: Architect - Qwen3.6 35B MoE
+  # Raw endpoint for debugging only. Prefer local-litellm above.
+  raw-vllm-fast-local:
+    api: http://127.0.0.1:8170/v1
+    default_model: fast_local
+    name: Raw vLLM Qwen3.6 35B NVFP4
     models:
-    - qwen3.6-35b-a3b-mtp
+    - fast_local
+    - qwen3.6-35b-a3b-nvfp4
     extra_body:
-      max_tokens: 4096
-      temperature: 1.0
+      max_tokens: 16384
+      temperature: 0.7
       top_p: 0.95
-      top_k: 20

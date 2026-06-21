@@ -1,0 +1,21 @@
+[Unit]
+Description=LiteLLM local routing gateway on 8180
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="LITELLM_CONFIG=%h/src/spark-llm-stack/litellm/config.example.yaml"
+Environment="LITELLM_HOST=127.0.0.1"
+Environment="LITELLM_PORT=8180"
+
+# Install LiteLLM in %h/venvs/litellm or override LITELLM_BIN in a drop-in.
+# Secrets belong in the service environment or ~/.hermes/.env, not in the repo config.
+ExecStart=/usr/bin/env bash -lc 'exec "${LITELLM_BIN:-%h/venvs/litellm/bin/litellm}" --config "${LITELLM_CONFIG}" --host "${LITELLM_HOST}" --port "${LITELLM_PORT}"'
+
+Restart=on-failure
+RestartSec=15
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target

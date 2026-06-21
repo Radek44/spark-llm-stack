@@ -1,0 +1,60 @@
+# LiteLLM routing template for DGX Spark.
+# Keep private aliases local-only: never give them cloud fallbacks.
+# Secrets belong in service environment or ~/.hermes/.env, not in this repo.
+
+model_list:
+  - model_name: fast_local
+    litellm_params:
+      model: openai/fast_local
+      api_base: http://127.0.0.1:8170/v1
+      api_key: local-dummy-key
+
+  - model_name: private_local
+    litellm_params:
+      model: openai/fast_local
+      api_base: http://127.0.0.1:8170/v1
+      api_key: local-dummy-key
+
+  - model_name: small_coder
+    litellm_params:
+      model: openai/small_coder
+      api_base: http://127.0.0.1:8190/v1
+      api_key: local-dummy-key
+
+  # Future optional local-only routes. Add services only after benchmarking.
+  # - model_name: nemotron_local
+  #   litellm_params:
+  #     model: openai/nemotron_local
+  #     api_base: http://127.0.0.1:8171/v1
+  #     api_key: local-dummy-key
+  #
+  # - model_name: coder_local
+  #   litellm_params:
+  #     model: openai/coder_local
+  #     api_base: http://127.0.0.1:8172/v1
+  #     api_key: local-dummy-key
+
+  # Uncomment only when API keys are configured outside this file.
+  # - model_name: code_frontier
+  #   litellm_params:
+  #     model: openai/gpt-5.4-thinking
+  #     api_key: os.environ/OPENAI_API_KEY
+  #
+  # - model_name: claude_frontier
+  #   litellm_params:
+  #     model: anthropic/claude-sonnet-5
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 1
+  timeout: 120
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  success_callback: []
+  failure_callback: []
+
+# Bound to 127.0.0.1 by litellm.service. If you expose this beyond localhost,
+# add a private runtime config with `general_settings.master_key` set from env.

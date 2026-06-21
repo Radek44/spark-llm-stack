@@ -1,0 +1,23 @@
+[Unit]
+Description=llama.cpp Gemma4 12B v2 coder/agentic GGUF on 8190
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="MODEL_PATH=%h/models/gemma4-v2-coder/gemma4-v2-Q4_K_M.gguf"
+Environment="MODEL_PORT=8190"
+Environment="MODEL_CTX=32768"
+Environment="MIN_MEMAVAILABLE_KIB=45000000"
+
+# Manual/on-demand only. This is a smaller coding-specialist checkpoint, not a boot service.
+ExecCondition=/usr/bin/env bash %h/src/spark-llm-stack/scripts/check-memavailable-kib ${MIN_MEMAVAILABLE_KIB}
+ExecCondition=/usr/bin/env bash -lc 'test -f "${MODEL_PATH}"'
+ExecStart=/usr/bin/env bash -lc 'exec "${LLAMA_SERVER:-/usr/local/bin/llama-server}" -m "${MODEL_PATH}" --host 127.0.0.1 --port "${MODEL_PORT}" --ctx-size "${MODEL_CTX}" --n-gpu-layers 99 -fa on --jinja --cache-type-k q8_0 --cache-type-v q8_0 --threads 12 --threads-batch 16 --top-k 64 --top-p 0.95 --temp 1.0'
+
+Restart=on-failure
+RestartSec=15
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target

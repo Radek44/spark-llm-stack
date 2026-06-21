@@ -95,6 +95,12 @@ is enabled at any time.
 
 ## Remediations
 
+These rules apply to every future heavyweight local AI service, including
+vLLM, NIM, llama.cpp, ComfyUI, and any RAG/UI service that loads a large GPU
+checkpoint. New model servers must be manual-only until benchmarked and must
+ship with cgroup caps, `OOMPolicy=stop`, restart limits, and systemd-level
+`Conflicts=` against other heavyweight checkpoint services.
+
 ### 1. Zero heavyweight autostart at boot
 
 ```bash
