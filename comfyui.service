@@ -1,0 +1,19 @@
+[Unit]
+Description=ComfyUI 0.29.2 on DGX Spark
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ComfyUI
+Environment="HF_HOME=%h/models/huggingface"
+Environment="PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128"
+ExecCondition=/usr/bin/env bash %h/src/spark-llm-stack/scripts/check-memavailable-kib 100000000
+ExecStart=%h/ai-agent-os/bin/dgx-gpu-run --label comfyui --profile image --timeout 30 -- %h/venvs/comfyui-0.29.2/bin/python main.py --listen 127.0.0.1 --port 8188 --extra-model-paths-config %h/src/spark-llm-stack/comfyui-extra-model-paths.yaml --reserve-vram 32 --vram-headroom 8 --disable-pinned-memory --fast-disk --cache-none --disable-cuda-malloc
+Restart=no
+TimeoutStartSec=10min
+TimeoutStopSec=120
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target

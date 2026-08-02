@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "status": "accepted_on_dgx_spark",
+  "host": "spark-7b90",
+  "acceptance_window": {
+    "started": "2026-08-01T22:33:35-07:00",
+    "stopped": "2026-08-01T22:44:48-07:00"
+  },
+  "runtime": {
+    "vllm": "0.26.0",
+    "model_id": "poolside/Laguna-S-2.1-NVFP4",
+    "model_revision": "07614121b31898586430f189d27a25a0be310843",
+    "draft_model_id": "poolside/Laguna-S-2.1-DFlash-NVFP4",
+    "draft_model_revision": "4cdcc6e9b29105e8ff5790885cadccbeb4f33f54",
+    "speculative_method": "dflash",
+    "speculative_tokens": 7,
+    "max_model_len": 32768,
+    "max_num_seqs": 1,
+    "max_num_batched_tokens": 4096,
+    "kv_cache_bytes": 4294967296,
+    "kv_cache_dtype": "bfloat16",
+    "enforce_eager": true,
+    "expandable_segments": false
+  },
+  "journal_evidence": {
+    "model_load_gib": 69.37,
+    "model_load_seconds": 450.648115,
+    "kv_cache_gib": 4.0,
+    "first_dflash_sample": {
+      "accepted_tokens": 185,
+      "drafted_tokens": 252,
+      "acceptance_rate_percent": 73.4
+    },
+    "chat_completion_http_200_count_minimum": 8,
+    "kernel_oom_or_nvidia_faults_in_window": 0
+  },
+  "same_session_observations": {
+    "minimum_mem_available_gib": 36.6,
+    "code_generation_seconds": 5.79,
+    "direct_chat": "passed",
+    "litellm_routed_chat": "passed",
+    "thinking_on_off": "passed",
+    "tool_call": "passed"
+  },
+  "evidence_limits": [
+    "Runtime configuration, load, HTTP status, speculative metrics, and the clean kernel interval are rechecked from the system journal.",
+    "The response bodies and independent MemAvailable sampler were transient same-session observations and were not retained; rerun the promotion canary before changing the accepted configuration.",
+    "The allocator environment variable was renamed after acceptance from the deprecated PYTORCH_CUDA_ALLOC_CONF alias to PYTORCH_ALLOC_CONF without changing its value."
+  ]
+}

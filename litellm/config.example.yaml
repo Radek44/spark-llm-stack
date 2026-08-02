@@ -15,13 +15,6 @@ model_list:
       api_base: http://127.0.0.1:8170/v1
       api_key: local-dummy-key
 
-  # Disabled: :8190 service is unreachable (connection-refused) 2026-07-04
-  # - model_name: small_coder
-  #   litellm_params:
-  #     model: openai/small_coder
-  #     api_base: http://127.0.0.1:8190/v1
-  #     api_key: local-dummy-key
-
   # Future optional local-only routes. Add services only after benchmarking.
   # - model_name: nemotron_local
   #   litellm_params:
@@ -49,10 +42,10 @@ model_list:
 router_settings:
   routing_strategy: simple-shuffle
   num_retries: 1
-  timeout: 120
+  timeout: 1200
 
 litellm_settings:
-  drop_params: true
+  drop_params: false
   set_verbose: false
   success_callback: []
   failure_callback: []

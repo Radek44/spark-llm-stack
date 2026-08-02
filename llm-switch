@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# llm-switch v4 — lean DGX Spark AI service switcher
+# llm-switch v5 — lean DGX Spark AI service switcher
 # Runtime:
-#   llm-switch [fast_local|small_coder|imagine|comfyui|litellm]
-#   llm-switch off
+#   llm-switch [fast_local|imagine|comfyui|litellm]
+#   llm-switch off | all-off
 #   llm-switch status
 # Boot:
 #   llm-switch boot-safe
@@ -12,44 +12,53 @@
 
 set -euo pipefail
 
-SLOTS=(fast_local small_coder imagine comfyui litellm)
-MODEL_SLOTS=(fast_local small_coder imagine comfyui)
+SLOTS=(fast_local imagine comfyui litellm)
+MODEL_SLOTS=(fast_local imagine comfyui)
 
 declare -A SVCS=(
-  [fast_local]="vllm-qwen36-35b-nvfp4.service"
-  [small_coder]="gemma4-v2-coder.service"
+  [fast_local]="vllm-laguna-s21-nvfp4.service"
   [imagine]="flux-klein.service"
   [comfyui]="comfyui.service"
   [litellm]="litellm.service"
 )
 declare -A PORTS=(
-  [fast_local]=8170 [small_coder]=8190 [imagine]=8160 [comfyui]=8188 [litellm]=8180
+  [fast_local]=8170 [imagine]=8160 [comfyui]=8188 [litellm]=8180
 )
 declare -A ROLES=(
-  [fast_local]="vLLM Qwen3.6-35B NVFP4 default local agent"
-  [small_coder]="llama.cpp Gemma4 12B v2 coding subagent experiment"
+  [fast_local]="vLLM Laguna S 2.1 NVFP4 + DFlash local agent"
   [imagine]="FLUX.2-klein direct image generation"
   [comfyui]="ComfyUI diffusion workflows"
   [litellm]="LiteLLM local routing gateway"
 )
 declare -A MIN_MEM_KIB=(
-  [fast_local]=90000000
-  [small_coder]=45000000
+  [fast_local]=115000000
   [imagine]=12000000
-  [comfyui]=30000000
+  [comfyui]=100000000
   [litellm]=2000000
 )
-WAIT_TIMEOUT=300
+WAIT_TIMEOUT_DEFAULT=300
+WAIT_TIMEOUT_LAGUNA=1200
 
 wait_ready() {
-  local slot=$1 port=${PORTS[$1]} elapsed=0
+  local slot=$1 port=${PORTS[$1]} elapsed=0 timeout=$WAIT_TIMEOUT_DEFAULT
+  [[ "$slot" = "fast_local" ]] && timeout=$WAIT_TIMEOUT_LAGUNA
   echo -n "  waiting for $slot on :$port"
   while ! curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1 \
       && ! curl -sf "http://127.0.0.1:$port/v1/models" > /dev/null 2>&1 \
       && ! curl -sf "http://127.0.0.1:$port/sdcpp/v1/capabilities" > /dev/null 2>&1 \
       && ! curl -sf "http://127.0.0.1:$port/" > /dev/null 2>&1; do
     sleep 2; elapsed=$((elapsed+2)); echo -n "."
-    [ $elapsed -ge $WAIT_TIMEOUT ] && { echo " TIMEOUT"; exit 1; }
+    if [ $elapsed -ge $timeout ]; then
+      echo " TIMEOUT — stopping $slot"
+      systemctl --user stop "${SVCS[$slot]}" 2>/dev/null || true
+      systemctl --user reset-failed "${SVCS[$slot]}" 2>/dev/null || true
+      exit 1
+    fi
+    if systemctl --user is-failed "${SVCS[$slot]}" >/dev/null 2>&1; then
+      echo " FAILED"
+      systemctl --user status "${SVCS[$slot]}" --no-pager --lines=20 >&2 || true
+      exit 1
+    fi
   done
   echo " ready (${elapsed}s)"
 }
@@ -95,7 +104,58 @@ show_status() {
   echo ""
   free -h | awk '/Mem:/{printf "  memory: %s used / %s total / %s available\n", $3, $2, $7}'
   free -h | awk '/Swap:/{printf "  swap:   %s used / %s total / %s free\n", $3, $2, $4}'
+  local lease="$HOME/.local/state/dgx-gpu/dgx-gpu-workload.lock"
+  if [[ -r "$lease" ]] && command -v jq >/dev/null 2>&1; then
+    local lease_state lease_label lease_profile
+    lease_state=$(jq -r '.state // "unknown"' "$lease" 2>/dev/null || echo unknown)
+    lease_label=$(jq -r '.label // "unknown"' "$lease" 2>/dev/null || echo unknown)
+    lease_profile=$(jq -r '.profile // "unknown"' "$lease" 2>/dev/null || echo unknown)
+    echo "  gpu lease: $lease_state ($lease_profile/$lease_label)"
+  fi
+  if command -v docker >/dev/null 2>&1; then
+    local gpu_containers
+    gpu_containers=$(for service in trellis-worker rig-worker rig-blender; do
+      docker ps \
+        --filter "label=com.docker.compose.project=spark-asset-forge-spark" \
+        --filter "label=com.docker.compose.service=$service" \
+        --format '{{.Names}}' 2>/dev/null
+    done | sort -u)
+    if [[ -n "$gpu_containers" ]]; then
+      echo "  asset GPU containers: running"
+      while IFS= read -r name; do echo "    $name"; done <<<"$gpu_containers"
+    else
+      echo "  asset GPU containers: off"
+    fi
+  fi
+  if curl -fsS --max-time 5 http://127.0.0.1:8180/health/readiness >/dev/null 2>&1; then
+    echo "  router: control plane ready"
+    local deep healthy unhealthy
+    deep=$(curl -fsS --max-time 10 http://127.0.0.1:8180/health 2>/dev/null) || deep=""
+    if [[ -n "$deep" ]] && command -v jq >/dev/null 2>&1; then
+      healthy=$(jq -r '(.healthy_endpoints // []) | length' <<<"$deep")
+      unhealthy=$(jq -r '(.unhealthy_endpoints // []) | length' <<<"$deep")
+      echo "  router: backends healthy=$healthy unhealthy=$unhealthy"
+    fi
+  else
+    echo "  router: control plane unavailable"
+  fi
   echo ""
+}
+
+stop_asset_gpu_containers() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local ids=() service id
+  for service in trellis-worker rig-worker rig-blender; do
+    while IFS= read -r id; do
+      [[ -n "$id" ]] && ids+=("$id")
+    done < <(docker ps -q \
+      --filter "label=com.docker.compose.project=spark-asset-forge-spark" \
+      --filter "label=com.docker.compose.service=$service" 2>/dev/null)
+  done
+  if [[ ${#ids[@]} -gt 0 ]]; then
+    echo "  stopping Asset Forge GPU containers..."
+    docker stop "${ids[@]}" >/dev/null
+  fi
 }
 
 boot_safe() {
@@ -177,7 +237,7 @@ boot_status() {
 CMD="${1:-status}"
 
 case "$CMD" in
-  fast_local|small_coder|imagine|comfyui|litellm)
+  fast_local|imagine|comfyui|litellm)
     target_svc="${SVCS[$CMD]}"
     echo "→ $CMD mode (${ROLES[$CMD]})"
     if [ "$CMD" != "litellm" ]; then
@@ -199,6 +259,14 @@ case "$CMD" in
     done
     sleep 3; show_status
     ;;
+  all-off)
+    echo "→ stopping all model/media services and Asset Forge GPU workers"
+    for slot in "${MODEL_SLOTS[@]}"; do
+      systemctl --user stop "${SVCS[$slot]}" 2>/dev/null || true
+    done
+    stop_asset_gpu_containers
+    sleep 3; show_status
+    ;;
   status)
     show_status
     ;;
@@ -217,15 +285,15 @@ case "$CMD" in
     ;;
   -h|--help|help)
     cat <<EOF
-llm-switch v4 — lean DGX Spark AI service switcher
+llm-switch v5 — lean DGX Spark AI service switcher
 
 Runtime:
-  llm-switch fast_local    start vLLM local LLM service
-  llm-switch small_coder   start Gemma4 12B v2 coding-specialist service
+  llm-switch fast_local    start Laguna S 2.1 through vLLM
   llm-switch litellm       start LiteLLM router without stopping models
   llm-switch imagine       start FLUX.2-klein direct image service
   llm-switch comfyui       start ComfyUI
   llm-switch off           stop model/media services, leave LiteLLM alone
+  llm-switch all-off       also stop Asset Forge GPU-profile containers
   llm-switch status        show current state and memory
 
 Boot:

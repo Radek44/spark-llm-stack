@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 Environment="CUDA_SCALE_LAUNCH_QUEUES=4x"
 
-ExecStart=%h/src/stable-diffusion.cpp/build/bin/sd-server \
+ExecStart=%h/ai-agent-os/bin/dgx-gpu-run --label flux-klein --profile image --timeout 30 -- \
+  %h/src/stable-diffusion.cpp/build/bin/sd-server \
   --diffusion-model %h/models/flux2-klein/flux-2-klein-4b.safetensors \
   --llm %h/models/flux2-klein/text_encoder/qwen_3_4b.safetensors \
   --vae %h/models/flux2-klein/ae.safetensors \
@@ -15,10 +16,10 @@ ExecStart=%h/src/stable-diffusion.cpp/build/bin/sd-server \
   --listen-port 8160 \
   --diffusion-fa \
   --type bf16 \
-  --max-vram 90 \
+  --max-vram 12 \
   --threads 8
 
-Restart=on-failure
+Restart=no
 RestartSec=5
 LimitNOFILE=1048576
 

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+registry=${DGX_MODEL_REGISTRY:-$HOME/ai-agent-os/config/model-registry.json}
+comfy_unit=$repo_root/comfyui.service
+
+fail() {
+  printf 'validate-stack: %s\n' "$*" >&2
+  exit 1
+}
+
+for script in "$repo_root"/harden-llm-stack.sh "$repo_root"/llm-switch "$repo_root"/scripts/run-vllm-laguna "$repo_root"/scripts/run-comfyui-canary; do
+  bash -n "$script"
+done
+python3 -m json.tool "$registry" >/dev/null
+python3 - "$registry" <<'PY'
+import json, sys
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+resources = document["resources"]
+assert resources["lease_wait_timeout_seconds"] == 30
+startup = resources["minimum_free_memory_gib"]
+runtime = resources["runtime_free_memory_floor_gib"]
+for name, profile in document["profiles"].items():
+    if profile.get("exclusive_gpu"):
+        assert name in startup, f"{name} lacks a startup threshold"
+        assert name in runtime, f"{name} lacks a runtime floor"
+PY
+"$HOME/ai-agent-os/shared/scripts/check-dgx-gpu-run.sh"
+"$repo_root/scripts/check-vllm-laguna-env"
+"$repo_root/scripts/validate-laguna-acceptance"
+
+if grep -Eq -- '--gpu-only|--highvram' "$comfy_unit"; then
+  fail 'ComfyUI may not use --gpu-only or --highvram on DGX unified memory'
+fi
+for required in 'dgx-gpu-run' '--extra-model-paths-config' '--reserve-vram 32' '--vram-headroom 8' '--disable-pinned-memory' '--fast-disk' '--cache-none'; do
+  grep -Fq -- "$required" "$comfy_unit" || fail "ComfyUI is missing $required"
+done
+
+for unit in vllm-laguna-s21-nvfp4.service flux-klein.service comfyui.service; do
+  if ! grep -Fq 'dgx-gpu-run' "$repo_root/$unit" && ! grep -Fq 'run-vllm-laguna' "$repo_root/$unit"; then
+    fail "$unit does not hold the machine-wide GPU lease"
+  fi
+  grep -Fq 'Restart=no' "$repo_root/$unit" || fail "$unit may automatically restart"
+  if [[ "$unit" != vllm-laguna-s21-nvfp4.service ]]; then
+    grep -Fq -- '--timeout 30' "$repo_root/$unit" || fail "$unit may wait indefinitely for the GPU lease"
+  fi
+done
+grep -Fq -- '--timeout "${DGX_LOCK_TIMEOUT:-30}"' "$repo_root/scripts/run-vllm-laguna" || fail 'Laguna may wait indefinitely for the GPU lease'
+grep -Fq -- 'LAGUNA_SPECULATIVE:-false' "$repo_root/scripts/run-vllm-laguna" || fail 'Laguna direct-launch default is not target-only'
+grep -Fq -- 'LAGUNA_ENFORCE_EAGER:-true' "$repo_root/scripts/run-vllm-laguna" || fail 'Laguna direct-launch default is not eager'
+grep -Fq 'MODEL_REVISION=07614121b31898586430f189d27a25a0be310843' "$repo_root/vllm-laguna-s21-nvfp4.service" || fail 'Laguna service is not pinned to the Spark-safe target'
+grep -Fq 'DRAFT_MODEL_REVISION=4cdcc6e9b29105e8ff5790885cadccbeb4f33f54' "$repo_root/vllm-laguna-s21-nvfp4.service" || fail 'Laguna service is not pinned to the matched Spark-safe draft'
+grep -Fq 'LAGUNA_SPECULATIVE=true' "$repo_root/vllm-laguna-s21-nvfp4.service" || fail 'Laguna service has not promoted the accepted DFlash draft'
+grep -Fq 'KV_CACHE_MEMORY_BYTES=4294967296' "$repo_root/vllm-laguna-s21-nvfp4.service" || fail 'Laguna service lacks the explicit 4 GiB KV cache cap'
+grep -Fq 'KV_CACHE_DTYPE=bfloat16' "$repo_root/vllm-laguna-s21-nvfp4.service" || fail 'Laguna service is not pinned to the quality-safe BF16 KV cache'
+grep -Fq 'PYTORCH_ALLOC_CONF=expandable_segments:False' "$repo_root/vllm-laguna-s21-nvfp4.service" || fail 'Laguna service still permits expandable CUDA segments'
+if rg -q 'PYTORCH_CUDA_ALLOC_CONF' "$repo_root" \
+  --glob '*.service' \
+  --glob '*.conf' \
+  --glob '*.yaml' \
+  --glob '*.sh' \
+  --glob 'run-*' \
+  --glob 'llm-switch'; then
+  fail 'managed stack still uses deprecated PYTORCH_CUDA_ALLOC_CONF'
+fi
+grep -Fq -- '--kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES"' "$repo_root/scripts/run-vllm-laguna" || fail 'Laguna launcher does not use explicit KV cache bytes'
+grep -Fq -- '--kv-cache-dtype "$KV_CACHE_DTYPE"' "$repo_root/scripts/run-vllm-laguna" || fail 'Laguna launcher does not use an explicit KV cache dtype'
+if grep -Fq -- '--calculate-kv-scales' "$repo_root/scripts/run-vllm-laguna"; then
+  fail 'Laguna launcher still requests deprecated runtime KV scale calculation'
+fi
+if grep -Fq -- '--gpu-memory-utilization' "$repo_root/scripts/run-vllm-laguna"; then
+  fail 'Laguna launcher may not use percentage-based KV cache auto-sizing'
+fi
+max_jobs=$(sed -n 's/^Environment="MAX_JOBS=\([0-9][0-9]*\)"/\1/p' "$repo_root/vllm-laguna-s21-nvfp4.service")
+[[ -n "$max_jobs" && "$max_jobs" -le 2 ]] || fail 'Laguna MAX_JOBS exceeds the cold-cache safety cap'
+grep -Fq '"llm": 20' "$HOME/ai-agent-os/config/model-registry.json" || fail 'Laguna runtime memory floor is below the first-load safety reserve'
+grep -Fq -- 'all-off)' "$repo_root/llm-switch" || fail 'llm-switch lacks the cross-runtime GPU stop'
+grep -Fq 'com.docker.compose.project=spark-asset-forge-spark' "$repo_root/llm-switch" || fail 'llm-switch may confuse mock workers with the real GPU profile'
+grep -Fq -- '--max-vram 12' "$repo_root/flux-klein.service" || fail 'dormant FLUX GPU budget exceeds the accepted back-burner cap'
+
+grep -Fq 'MemoryMax=84G' "$repo_root/drop-ins/comfyui.service.d/override.conf" || fail 'ComfyUI MemoryMax drifted'
+grep -Fq 'MemoryMax=108G' "$repo_root/drop-ins/vllm-laguna-s21-nvfp4.service.d/override.conf" || fail 'Laguna MemoryMax drifted'
+systemd-analyze --user verify "$repo_root"/*.service
+test -r "$repo_root/comfyui-extra-model-paths.yaml" || fail 'canonical ComfyUI model map is missing'
+
+declare -A expected_high=(
+  [vllm-laguna-s21-nvfp4.service]=100
+  [flux-klein.service]=12
+  [comfyui.service]=76
+)
+declare -A expected_max=(
+  [vllm-laguna-s21-nvfp4.service]=108
+  [flux-klein.service]=16
+  [comfyui.service]=84
+)
+declare -A expected_swap=(
+  [vllm-laguna-s21-nvfp4.service]=0
+  [flux-klein.service]=0
+  [comfyui.service]=0
+)
+
+for unit in "${!expected_max[@]}"; do
+  dropin=$repo_root/drop-ins/$unit.d/override.conf
+  grep -Fq "MemoryHigh=${expected_high[$unit]}G" "$dropin" || fail "$unit tracked MemoryHigh drifted"
+  grep -Fq "MemoryMax=${expected_max[$unit]}G" "$dropin" || fail "$unit tracked MemoryMax drifted"
+  if [[ "${expected_swap[$unit]}" -eq 0 ]]; then
+    grep -Fq 'MemorySwapMax=0' "$dropin" || fail "$unit tracked swap cap drifted"
+  else
+    grep -Fq "MemorySwapMax=${expected_swap[$unit]}G" "$dropin" || fail "$unit tracked swap cap drifted"
+  fi
+  grep -Fq 'StartLimitBurst=2' "$dropin" || fail "$unit tracked start limit drifted"
+  grep -Fq 'StartLimitIntervalSec=1800' "$dropin" || fail "$unit tracked start interval drifted"
+
+  deployed=$HOME/.config/systemd/user/$unit
+  if [[ -f "$deployed" ]]; then
+    cmp -s "$repo_root/$unit" "$deployed" || fail "$unit deployed base differs from repository"
+    [[ "$(systemctl --user show "$unit" -p Restart --value)" == no ]] || fail "$unit deployed Restart is unsafe"
+    [[ "$(systemctl --user show "$unit" -p UnitFileState --value)" == disabled ]] || fail "$unit is enabled at boot"
+    max_bytes=$(systemctl --user show "$unit" -p MemoryMax --value)
+    expected_bytes=$(( expected_max[$unit] * 1024 * 1024 * 1024 ))
+    [[ "$max_bytes" -eq "$expected_bytes" ]] || fail "$unit deployed MemoryMax drifted"
+    conflicts=$(systemctl --user show "$unit" -p Conflicts --value)
+    for peer in "${!expected_max[@]}"; do
+      [[ "$peer" == "$unit" ]] && continue
+      [[ " $conflicts " == *" $peer "* ]] || fail "$unit does not conflict with $peer"
+    done
+  fi
+done
+
+for retired in vllm-qwen36-35b-nvfp4.service gemma4-v2-coder.service; do
+  [[ ! -e "$repo_root/$retired" ]] || fail "$retired remains in the managed stack"
+  [[ ! -e "$HOME/.config/systemd/user/$retired" ]] || fail "$retired remains deployed"
+  [[ ! -e "$repo_root/drop-ins/$retired.d/override.conf" ]] || fail "$retired tracked drop-in remains"
+  [[ ! -e "$HOME/.config/systemd/user/$retired.d/override.conf" ]] || fail "$retired deployed drop-in remains"
+done
+
+litellm_dropin=$repo_root/drop-ins/litellm.service.d/override.conf
+grep -Fq 'MemoryHigh=2G' "$litellm_dropin" || fail 'LiteLLM tracked MemoryHigh drifted'
+grep -Fq 'MemoryMax=4G' "$litellm_dropin" || fail 'LiteLLM tracked MemoryMax drifted'
+grep -Fq 'MemorySwapMax=512M' "$litellm_dropin" || fail 'LiteLLM tracked swap cap drifted'
+grep -Fq 'OOMScoreAdjust=100' "$litellm_dropin" || fail 'LiteLLM tracked OOM score drifted'
+grep -Fq 'Restart=on-failure' "$litellm_dropin" || fail 'LiteLLM tracked restart policy drifted'
+if [[ -f "$HOME/.config/systemd/user/litellm.service" ]]; then
+  [[ "$(systemctl --user show litellm.service -p Restart --value)" == on-failure ]] || fail 'LiteLLM deployed Restart drifted'
+  [[ "$(systemctl --user show litellm.service -p OOMScoreAdjust --value)" == 100 ]] || fail 'LiteLLM deployed OOM score drifted'
+  [[ "$(systemctl --user show litellm.service -p UnitFileState --value)" == enabled ]] || fail 'LiteLLM router is not enabled'
+fi
+grep -Fq 'timeout: 1200' "$repo_root/litellm/config.example.yaml" || fail 'LiteLLM timeout is too short for long local generations'
+grep -Fq 'drop_params: false' "$repo_root/litellm/config.example.yaml" || fail 'LiteLLM silently drops request controls'
+
+"$repo_root/harden-llm-stack.sh" --dry-run >/dev/null
+printf 'validate-stack: ok\n'

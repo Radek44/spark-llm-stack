@@ -8,7 +8,7 @@
 #   ./harden-llm-stack.sh --dry-run          show planned changes, do nothing
 #   ./harden-llm-stack.sh --revert           remove only drop-ins we created
 
-set -uo pipefail
+set -euo pipefail
 
 DRYRUN=0
 REVERT=0
@@ -27,10 +27,9 @@ MARKER="# managed-by:harden-llm-stack"
 
 # format: unit | MemoryHigh | MemoryMax | MemorySwapMax | heavyweight (1 = in Conflicts pool)
 SERVICES=(
-  "vllm-qwen36-35b-nvfp4.service|65G|80G|4G|1"
-  "gemma4-v2-coder.service|24G|32G|2G|1"
-  "flux-klein.service|12G|16G|1G|0"
-  "comfyui.service|30G|40G|2G|0"
+  "vllm-laguna-s21-nvfp4.service|100G|108G|0|1"
+  "flux-klein.service|12G|16G|0|1"
+  "comfyui.service|76G|84G|0|1"
   "litellm.service|2G|4G|512M|0"
 )
 
@@ -45,11 +44,13 @@ unit_file_path() { printf '%s/%s' "$USER_DIR" "$1"; }
 unit_present() { [[ -f "$(unit_file_path "$1")" ]]; }
 
 build_override() {
-  local unit="$1" hi="$2" mx="$3" sw="$4" heavy="$5" conflicts=""
+  local unit="$1" hi="$2" mx="$3" sw="$4" heavy="$5" conflicts="" restart="on-failure" oom_score=100
   if [[ "$heavy" = "1" ]]; then
     local cs=()
     for h in "${HEAVY[@]}"; do [[ "$h" != "$unit" ]] && cs+=("$h"); done
     conflicts="${cs[*]}"
+    restart="no"
+    oom_score=200
   fi
 
   cat <<EOF
@@ -59,28 +60,49 @@ $MARKER
 
 [Unit]
 $( [[ -n "$conflicts" ]] && echo "Conflicts=$conflicts" )
-StartLimitBurst=3
-StartLimitIntervalSec=600
+StartLimitBurst=$([[ "$heavy" = "1" ]] && echo 2 || echo 3)
+StartLimitIntervalSec=$([[ "$heavy" = "1" ]] && echo 1800 || echo 600)
 
 [Service]
 MemoryHigh=$hi
 MemoryMax=$mx
 MemorySwapMax=$sw
 OOMPolicy=stop
-OOMScoreAdjust=200
-Restart=on-failure
+OOMScoreAdjust=$oom_score
+Restart=$restart
 RestartSec=15
+$( [[ "$heavy" = "1" ]] && echo "RestartPreventExitStatus=75 78" )
 EOF
 }
 
+validate_comfy_unit() {
+  local unit
+  unit=$(unit_file_path comfyui.service)
+  [[ -f "$unit" ]] || return 0
+  if grep -Eq -- '--gpu-only|--highvram' "$unit"; then
+    echo "refusing unsafe ComfyUI unit: --gpu-only/--highvram is forbidden on unified memory" >&2
+    return 1
+  fi
+  local required
+  for required in 'dgx-gpu-run' '--reserve-vram 32' '--vram-headroom 8' '--disable-pinned-memory' '--fast-disk' '--cache-none'; do
+    if ! grep -Fq -- "$required" "$unit"; then
+      echo "refusing unsafe ComfyUI unit: missing $required" >&2
+      return 1
+    fi
+  done
+}
+
 write_dropin() {
-  local unit="$1" hi="$2" mx="$3" sw="$4" heavy="$5" target dir
+  local unit="$1" hi="$2" mx="$3" sw="$4" heavy="$5" target dir temp
   target=$(dropin_path "$unit")
   dir=$(dirname "$target")
   printf '  + %-35s  cap=%s/%s swap=%s conflicts=%s\n' "$unit" "$hi" "$mx" "$sw" "$([[ $heavy = 1 ]] && echo yes || echo no)"
   [[ "$DRYRUN" = "1" ]] && return
   mkdir -p "$dir"
-  build_override "$unit" "$hi" "$mx" "$sw" "$heavy" >"$target"
+  temp=$(mktemp "$dir/.override.conf.XXXXXX")
+  build_override "$unit" "$hi" "$mx" "$sw" "$heavy" >"$temp"
+  chmod 0644 "$temp"
+  mv "$temp" "$target"
 }
 
 revert_dropin() {
@@ -105,12 +127,16 @@ reload_daemon() {
 }
 
 echo
+if [[ "$REVERT" != "1" ]]; then
+  validate_comfy_unit || exit 1
+fi
+
 if [[ "$REVERT" = "1" ]]; then
   echo "▶ REVERT mode — removing drop-ins created by this script"
 else
   echo "▶ APPLY mode$( [[ $DRYRUN = 1 ]] && echo ' (DRY-RUN)' )"
   echo "  • ${#HEAVY[@]} heavyweight service(s) in mutual-exclusion pool"
-  echo "  • all managed services get MemoryHigh/MemoryMax + OOMPolicy=stop + StartLimitBurst=3"
+  echo "  • all managed services get MemoryHigh/MemoryMax + OOMPolicy=stop"
 fi
 echo
 
@@ -141,7 +167,7 @@ echo
 cat <<'EOF'
 Next: verify the drop-ins took effect.
 
-  for u in vllm-qwen36-35b-nvfp4 gemma4-v2-coder flux-klein comfyui litellm; do
+  for u in vllm-laguna-s21-nvfp4 flux-klein comfyui litellm; do
     echo "=== $u ==="
     systemctl --user show "$u" -p MemoryHigh,MemoryMax,MemorySwapMax,OOMPolicy,Restart,StartLimitBurst,Conflicts | sed 's/^/  /'
   done

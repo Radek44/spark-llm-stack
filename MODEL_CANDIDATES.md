@@ -1,32 +1,20 @@
 # Model candidates for DGX Spark local serving
 
-Snapshot source: Hugging Face Hub API queries run on 2026-06-20 for text-generation downloads/likes plus targeted Qwen, Nemotron, and coder searches.
+Current selection verified from Poolside and Hugging Face primary sources on 2026-08-01. The older discovery evidence below remains dated 2026-06-20.
 
 ## Recommendation
 
 Keep the local LLM stack lean:
 
-1. Default local agent model: `nvidia/Qwen3.6-35B-A3B-NVFP4`
-   - HF search: ~3.6M downloads, NVIDIA FP4, vLLM-oriented, explicitly aligned with DGX Spark/Hermes guidance.
-   - Role: `fast_local`, `private_local`.
-   - Installed and booted via vLLM 0.23.0 on this host with `max_model_len=65536` and `gpu_memory_utilization=0.50` to avoid unified-memory pressure.
-   - Observed warning: vLLM selected Marlin weight-only FP4 and logged that native FP4 compute was not detected. If throughput is disappointing, compare against `Qwen/Qwen3.6-35B-A3B-FP8` before adding more models.
-2. NVIDIA-native alternate: `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4`
-   - HF search: ~772k downloads for NVFP4, 30B/A3B MoE, NVIDIA-native tool/reasoning family.
-   - Role: second service only after the Qwen vLLM baseline is stable.
-3. Coding specialist candidate: `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8` or an AWQ/vLLM quant such as `QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ`
-   - HF coder search: Qwen3-Coder-30B-A3B-Instruct ~1.9M downloads; FP8 ~990k; AWQ vLLM quant exists.
-   - Role: optional coding slot if local code work needs a specialist. Still route high-stakes coding to frontier models.
-4. Small coding subagent experiment: `yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF`
-   - HF metadata on 2026-06-20: v2 had ~6.3k downloads / 184 likes after one day; v1 had ~312k downloads / 1,983 likes and was #1 trending.
-   - Role: manual-only `small_coder` slot via llama.cpp Q4_K_M, useful for cheap coding subagents and terminal-agent experiments.
-   - Caveat: community fine-tune with narrow/self-reported agentic coding benchmarks; do not make it the default Hermes brain.
-5. Experimental large reasoning model: `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4`
-   - HF search: ~1.5M downloads, 120B/A12B NVFP4.
-   - Role: experiment only, one checkpoint at a time, expect memory pressure. Do not make this the default.
-6. Cheap/general fallback: `openai/gpt-oss-20b`
-   - HF downloads top list: ~6.8M downloads, vLLM + mxfp4 tags.
-   - Role: optional small/fast general route if Qwen is too heavy; otherwise skip to keep the machine clean.
+1. Accepted default local agent: `poolside/Laguna-S-2.1-NVFP4`
+   - Pin the last DGX-sized target revision `07614121b31898586430f189d27a25a0be310843` and its spinquant-removal DFlash revision `4cdcc6e9b29105e8ff5790885cadccbeb4f33f54`.
+   - Role: `fast_local`, `private_local`, native interleaved thinking, and Poolside tool parsing.
+   - Use vLLM 0.26.0, 32,768 tokens, one sequence, eager execution, an explicit 4 GiB BF16 KV cache, `expandable_segments:False`, and DFlash rather than MTP. The accepted run held at least 36.6 GiB `MemAvailable`; direct and LiteLLM-routed output, thinking, tools, and speculative acceptance passed.
+   - Requalify FP8 KV separately: it produced severe repetition and NVIDIA allocation errors locally despite Poolside's advertised FP8-KV scheme. The experimental expandable allocator also produced errors when attaching DFlash.
+   - Poolside replaced the target on 2026-08-01: the original official target is 66.98 GiB, while revision `f8fdfcdc4e7b0c474a0102430a8cae0a3a358669` is 92.85 GiB despite upstream prose still saying roughly 71-72 GB. The newer target crossed the 20 GiB host-memory floor during weight load and was removed from the local cache after the safe pin passed.
+2. Do not add another resident coding or reasoning checkpoint by default.
+   - Hosted `architect`, `implementer`, `mechanical`, and `adversary` profiles remain authoritative for Agent OS roles.
+   - Re-evaluate a small local specialist only from measured quality/latency demand, not as another standing service.
 
 ## Why not keep the old GGUF stack
 
@@ -37,7 +25,7 @@ The old llama.cpp GGUF services were useful during tuning, but they add operatio
 - risk of accidentally starting old heavyweight checkpoints;
 - duplicate routing config now that LiteLLM exists.
 
-Keep the source/build trees if you still use llama.cpp for benchmarking, but remove old model services and cached GGUF checkpoints from the always-on stack.
+The old model services and cached GGUF checkpoints were removed after Laguna acceptance. Archived llama.cpp source/build trees remain available for future benchmarking.
 
 ## HF evidence captured
 
@@ -77,19 +65,9 @@ Targeted coder search:
 Current clean target:
 
 ```text
-fast_local -> nvidia/Qwen3.6-35B-A3B-NVFP4 via vLLM on :8170
+fast_local -> poolside/Laguna-S-2.1-NVFP4 + matched DFlash via vLLM on :8170
 private_local -> same local-only model, no cloud fallback
 litellm -> 127.0.0.1:8180 router
-```
-
-Add later only if needed:
-
-```text
-nemotron_local -> nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
-coder_local -> Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 or AWQ
-small_coder -> yuxinlu1/gemma-4-12B-agentic-fable5-composer2.5-v2-3.5x-tau2-GGUF Q4_K_M via llama.cpp on :8190
-large_reasoner_experiment -> nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
-cheap_general -> openai/gpt-oss-20b
 ```
 
 Never enable more than one heavyweight checkpoint at boot.

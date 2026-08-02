@@ -16,7 +16,6 @@ providers:
     models:
     - fast_local
     - private_local
-    - small_coder
     # Optional future local routes:
     # - nemotron_local
     # - coder_local
@@ -32,10 +31,10 @@ providers:
   raw-vllm-fast-local:
     api: http://127.0.0.1:8170/v1
     default_model: fast_local
-    name: Raw vLLM Qwen3.6 35B NVFP4
+    name: Raw vLLM Laguna S 2.1 NVFP4
     models:
     - fast_local
-    - qwen3.6-35b-a3b-nvfp4
+    - laguna-s-2.1-nvfp4
     extra_body:
       max_tokens: 16384
       temperature: 0.7
