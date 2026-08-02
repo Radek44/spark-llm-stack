@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+workflow=${1:-$repo_root/workflows/comfyui-sd15-canary.json}
+base_url=${COMFY_URL:-http://127.0.0.1:8188}
+output_root=${COMFY_OUTPUT_ROOT:-$HOME/ComfyUI/output}
+started_here=0
+
+cleanup() {
+  if [[ "$started_here" -eq 1 && "${KEEP_COMFY_RUNNING:-false}" != true ]]; then
+    systemctl --user stop comfyui.service >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if ! curl -fsS --max-time 2 "$base_url/system_stats" >/dev/null 2>&1; then
+  "$HOME/.local/bin/llm-switch" comfyui >/dev/null
+  started_here=1
+fi
+
+request=$(jq -n --slurpfile prompt "$workflow" '{prompt: $prompt[0], client_id: "modernize-canary"}')
+response=$(curl -fsS --max-time 30 -H 'Content-Type: application/json' -d "$request" "$base_url/prompt")
+prompt_id=$(jq -er '.prompt_id' <<<"$response")
+
+history=''
+for _ in $(seq 1 300); do
+  history=$(curl -fsS --max-time 5 "$base_url/history/$prompt_id")
+  if jq -e --arg id "$prompt_id" '.[$id].outputs["7"].images[0]' <<<"$history" >/dev/null; then
+    break
+  fi
+  if jq -e --arg id "$prompt_id" '.[$id].status.status_str == "error"' <<<"$history" >/dev/null; then
+    echo "ComfyUI canary failed: $prompt_id" >&2
+    exit 1
+  fi
+  sleep 2
+done
+
+image=$(jq -er --arg id "$prompt_id" '.[$id].outputs["7"].images[0]' <<<"$history")
+filename=$(jq -r '.filename' <<<"$image")
+subfolder=$(jq -r '.subfolder // ""' <<<"$image")
+output=$output_root/$subfolder/$filename
+[[ -f "$output" ]] || { echo "missing ComfyUI output: $output" >&2; exit 1; }
+curl -fsS --max-time 10 -H 'Content-Type: application/json' \
+  -d '{"unload_models":true,"free_memory":true}' "$base_url/free" >/dev/null
+printf '%s\n' "$output"

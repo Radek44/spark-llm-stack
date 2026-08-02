@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+report="$repo_root/acceptance/laguna-s21-dgx-spark-20260801.json"
+start='2026-08-01 22:33:35'
+stop='2026-08-01 22:44:48'
+
+python3 -m json.tool "$report" >/dev/null
+python3 - "$report" <<'PY'
+import json, sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert report["schema_version"] == 1
+assert report["status"] == "accepted_on_dgx_spark"
+runtime = report["runtime"]
+assert runtime["vllm"] == "0.26.0"
+assert runtime["model_revision"] == "07614121b31898586430f189d27a25a0be310843"
+assert runtime["draft_model_revision"] == "4cdcc6e9b29105e8ff5790885cadccbeb4f33f54"
+assert runtime["kv_cache_bytes"] == 4294967296
+assert runtime["kv_cache_dtype"] == "bfloat16"
+assert runtime["enforce_eager"] is True
+PY
+
+journal=$(journalctl --user -u vllm-laguna-s21-nvfp4.service \
+  --since "$start" --until "$stop" --no-pager -o cat)
+for required in \
+  'revision=07614121b31898586430f189d27a25a0be310843' \
+  "revision': '4cdcc6e9b29105e8ff5790885cadccbeb4f33f54'" \
+  'Initializing a V1 LLM engine (v0.26.0)' \
+  'Model loading took 69.37 GiB memory' \
+  'reserved 4.0 GiB memory for KV Cache' \
+  'Application startup complete' \
+  'Accepted: 185 tokens, Drafted: 252 tokens' \
+  'Avg Draft acceptance rate: 73.4%'; do
+  grep -Fq "$required" <<<"$journal" || {
+    echo "Laguna acceptance journal is missing: $required" >&2
+    exit 1
+  }
+done
+
+http_ok_count=$(grep -Fc 'POST /v1/chat/completions HTTP/1.1" 200 OK' <<<"$journal")
+(( http_ok_count >= 8 )) || {
+  echo "Laguna acceptance journal has only $http_ok_count successful chat requests" >&2
+  exit 1
+}
+
+kernel_faults=$(journalctl -k --since "$start" --until "$stop" --no-pager -o cat | \
+  rg -i 'oom|out of memory|killed process|nvrm|xid' || true)
+[[ -z "$kernel_faults" ]] || {
+  echo "Laguna acceptance window contains kernel memory/GPU faults:" >&2
+  printf '%s\n' "$kernel_faults" >&2
+  exit 1
+}
+
+echo "validate-laguna-acceptance: journal-backed runtime evidence passed; response-body observations remain recorded-only"

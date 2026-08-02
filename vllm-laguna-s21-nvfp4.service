@@ -1,0 +1,43 @@
+[Unit]
+Description=vLLM Laguna S 2.1 NVFP4 with DFlash on 8170
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="HF_HOME=%h/models/huggingface"
+Environment="VLLM_CACHE_ROOT=%h/.cache/vllm-laguna"
+Environment="VLLM_WORKER_MULTIPROC_METHOD=spawn"
+Environment="CUTE_DSL_ARCH=sm_121a"
+Environment="CUDA_HOME=/usr/local/cuda"
+Environment="PATH=/usr/local/cuda/bin:/usr/local/bin:/usr/bin"
+Environment="MAX_JOBS=2"
+Environment="PYTORCH_ALLOC_CONF=expandable_segments:False"
+Environment="VLLM_PYTHON=%h/venvs/vllm-laguna-0.26.0/bin/python"
+Environment="MODEL_ID=poolside/Laguna-S-2.1-NVFP4"
+Environment="MODEL_REVISION=07614121b31898586430f189d27a25a0be310843"
+Environment="DRAFT_MODEL_ID=poolside/Laguna-S-2.1-DFlash-NVFP4"
+Environment="DRAFT_MODEL_REVISION=4cdcc6e9b29105e8ff5790885cadccbeb4f33f54"
+Environment="MODEL_PORT=8170"
+Environment="SERVED_MODEL=fast_local"
+Environment="MAX_MODEL_LEN=32768"
+Environment="MAX_NUM_SEQS=1"
+Environment="MAX_NUM_BATCHED_TOKENS=4096"
+Environment="KV_CACHE_MEMORY_BYTES=4294967296"
+Environment="KV_CACHE_DTYPE=bfloat16"
+Environment="LAGUNA_SPECULATIVE=true"
+Environment="LAGUNA_ENFORCE_EAGER=true"
+
+# The accepted service keeps eager execution, reduced context, an explicit
+# 4 GiB BF16 KV cache, and enough host headroom for the unified-memory
+# watchdog. Do not use percentage-based KV auto-sizing here. The target-only
+# and matched DFlash memory/API/quality gates passed before DFlash promotion.
+ExecStart=%h/src/spark-llm-stack/scripts/run-vllm-laguna
+
+Restart=no
+TimeoutStartSec=30min
+TimeoutStopSec=120
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target

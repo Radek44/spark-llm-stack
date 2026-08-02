@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+python_bin=${VLLM_PYTHON:-$HOME/venvs/vllm-laguna-0.26.0/bin/python}
+hf_home=${HF_HOME:-$HOME/models/huggingface}
+target_revision=07614121b31898586430f189d27a25a0be310843
+draft_revision=4cdcc6e9b29105e8ff5790885cadccbeb4f33f54
+target=$hf_home/hub/models--poolside--Laguna-S-2.1-NVFP4/snapshots/$target_revision
+draft=$hf_home/hub/models--poolside--Laguna-S-2.1-DFlash-NVFP4/snapshots/$draft_revision
+
+"$python_bin" - "$target" "$draft" <<'PY'
+import json, pathlib, sys
+from importlib.metadata import version
+from vllm.model_executor.models import ModelRegistry
+
+assert version("vllm") == "0.26.0"
+assert version("torch").startswith("2.11.0+")
+assert version("flashinfer-python") == "0.6.14"
+target, draft = map(pathlib.Path, sys.argv[1:])
+target_config = json.loads((target / "config.json").read_text())
+draft_config = json.loads((draft / "config.json").read_text())
+assert target_config["architectures"] == ["LagunaForCausalLM"]
+assert target_config["max_position_embeddings"] == 262144
+assert "LagunaForCausalLM" in ModelRegistry.models
+assert draft_config["num_hidden_layers"] == 6
+target_weights = list(target.glob("model-*-of-00015.safetensors"))
+draft_weights = list(draft.glob("*.safetensors"))
+assert len(target_weights) == 15
+assert sum(path.stat().st_size for path in target_weights) == 71916714120
+assert len(draft_weights) == 1
+assert sum(path.stat().st_size for path in draft_weights) == 2229962896
+assert not list(target.parent.parent.glob("**/*.incomplete"))
+assert not list(draft.parent.parent.glob("**/*.incomplete"))
+print("vllm-env: versions, native Laguna registry, and pinned snapshots are present")
+PY
+
+set +e
+pip_check=$($python_bin -m pip check 2>&1)
+pip_rc=$?
+set -e
+if [[ "$pip_rc" -ne 0 ]]; then
+  expected='nvidia-cusparselt-cu13 0.8.0 is not supported on this platform'
+  [[ "$pip_check" == "$expected" ]] || { printf '%s\n' "$pip_check" >&2; exit "$pip_rc"; }
+  wheel=$($python_bin - <<'PY'
+from importlib.metadata import distribution
+dist = distribution("nvidia-cusparselt-cu13")
+print(dist.locate_file("nvidia_cusparselt_cu13-0.8.0.dist-info/WHEEL"))
+PY
+)
+  library=$($python_bin - <<'PY'
+from importlib.metadata import distribution
+dist = distribution("nvidia-cusparselt-cu13")
+print(dist.locate_file("nvidia/cusparselt/lib/libcusparseLt.so.0"))
+PY
+)
+  grep -Fq 'Tag: py3-none-manylinux2014_sbsa' "$wheel"
+  readelf -h "$library" | grep -Fq 'Machine:                           AArch64'
+  echo 'vllm-env: accepted known pip tag mismatch; cuSPARSELt is the NVIDIA SBSA/AArch64 wheel'
+fi
+
+cache=$HOME/.cache/flashinfer/0.6.14/121a
+if [[ ! -d "$cache/cached_ops" ]]; then
+  echo 'vllm-env: warning: FlashInfer 0.6.14 sm_121a cache is cold; keep target eager and MAX_JOBS<=2' >&2
+fi
+echo 'check-vllm-laguna-env: ok'

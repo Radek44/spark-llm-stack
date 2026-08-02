@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DGX_GPU_RUN="${DGX_GPU_RUN:-$HOME/ai-agent-os/bin/dgx-gpu-run}"
+VLLM_PYTHON="${VLLM_PYTHON:-$HOME/venvs/vllm-laguna-0.26.0/bin/python}"
+MODEL_ID="${MODEL_ID:-poolside/Laguna-S-2.1-NVFP4}"
+MODEL_REVISION="${MODEL_REVISION:-07614121b31898586430f189d27a25a0be310843}"
+DRAFT_MODEL_ID="${DRAFT_MODEL_ID:-poolside/Laguna-S-2.1-DFlash-NVFP4}"
+DRAFT_MODEL_REVISION="${DRAFT_MODEL_REVISION:-4cdcc6e9b29105e8ff5790885cadccbeb4f33f54}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-4294967296}"
+KV_CACHE_MEMORY_BYTES_SAFE_MAX=4294967296
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bfloat16}"
+
+[[ -x "$DGX_GPU_RUN" ]] || { echo "missing DGX GPU launcher: $DGX_GPU_RUN" >&2; exit 78; }
+[[ -x "$VLLM_PYTHON" ]] || { echo "missing vLLM interpreter: $VLLM_PYTHON" >&2; exit 78; }
+[[ "$KV_CACHE_MEMORY_BYTES" =~ ^[1-9][0-9]*$ ]] || {
+  echo "KV_CACHE_MEMORY_BYTES must be a positive integer" >&2
+  exit 78
+}
+case "$KV_CACHE_DTYPE" in
+  bfloat16|fp8) ;;
+  *) echo "KV_CACHE_DTYPE must be bfloat16 or fp8" >&2; exit 78 ;;
+esac
+if (( KV_CACHE_MEMORY_BYTES > KV_CACHE_MEMORY_BYTES_SAFE_MAX )) && \
+   [[ "${LAGUNA_ALLOW_LARGER_KV_CACHE:-false}" != "true" ]]; then
+  echo "KV_CACHE_MEMORY_BYTES exceeds the 4 GiB DGX Spark safety cap" >&2
+  echo "set LAGUNA_ALLOW_LARGER_KV_CACHE=true only for a separately monitored promotion gate" >&2
+  exit 78
+fi
+
+args=(
+  -m vllm.entrypoints.openai.api_server
+  --host 127.0.0.1
+  --port "${MODEL_PORT:-8170}"
+  --model "$MODEL_ID"
+  --revision "$MODEL_REVISION"
+  --served-model-name "${SERVED_MODEL:-fast_local}" laguna-s-2.1-nvfp4
+  --max-model-len "${MAX_MODEL_LEN:-32768}"
+  --max-num-seqs "${MAX_NUM_SEQS:-1}"
+  --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-4096}"
+  --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES"
+  --kv-cache-dtype "$KV_CACHE_DTYPE"
+  --enable-prefix-caching
+  --enable-auto-tool-choice
+  --tool-call-parser poolside_v1
+  --reasoning-parser poolside_v1
+  --default-chat-template-kwargs '{"enable_thinking":true}'
+)
+
+if [[ "${LAGUNA_ENFORCE_EAGER:-true}" = "true" ]]; then
+  args+=(--enforce-eager)
+fi
+
+if [[ "${LAGUNA_SPECULATIVE:-false}" = "true" ]]; then
+  spec_config=$(printf \
+    '{"model":"%s","revision":"%s","method":"dflash","num_speculative_tokens":7,"kv_cache_dtype":"bfloat16"}' \
+    "$DRAFT_MODEL_ID" "$DRAFT_MODEL_REVISION")
+  args+=(--speculative-config "$spec_config")
+fi
+
+exec "$DGX_GPU_RUN" --label laguna-s-2.1 --profile llm \
+  --timeout "${DGX_LOCK_TIMEOUT:-30}" -- \
+  "$VLLM_PYTHON" "${args[@]}"

@@ -1,0 +1,2 @@
+# ComfyUI-LTXVideo imports kornia.geometry.transform.pad, removed in 0.8.3.
+kornia==0.8.2
