@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-registry=${DGX_MODEL_REGISTRY:-$HOME/ai-agent-os/config/model-registry.json}
+registry=${DGX_MODEL_REGISTRY:-$HOME/ai-agent-os/config/dgx-runtime-registry.json}
 comfy_unit=$repo_root/comfyui.service
 
 fail() {
@@ -74,7 +74,7 @@ if grep -Fq -- '--gpu-memory-utilization' "$repo_root/scripts/run-vllm-laguna"; 
 fi
 max_jobs=$(sed -n 's/^Environment="MAX_JOBS=\([0-9][0-9]*\)"/\1/p' "$repo_root/vllm-laguna-s21-nvfp4.service")
 [[ -n "$max_jobs" && "$max_jobs" -le 2 ]] || fail 'Laguna MAX_JOBS exceeds the cold-cache safety cap'
-grep -Fq '"llm": 20' "$HOME/ai-agent-os/config/model-registry.json" || fail 'Laguna runtime memory floor is below the first-load safety reserve'
+grep -Fq '"llm": 20' "$registry" || fail 'Laguna runtime memory floor is below the first-load safety reserve'
 grep -Fq -- 'all-off)' "$repo_root/llm-switch" || fail 'llm-switch lacks the cross-runtime GPU stop'
 grep -Fq 'com.docker.compose.project=spark-asset-forge-spark' "$repo_root/llm-switch" || fail 'llm-switch may confuse mock workers with the real GPU profile'
 grep -Fq -- '--max-vram 12' "$repo_root/flux-klein.service" || fail 'dormant FLUX GPU budget exceeds the accepted back-burner cap'
