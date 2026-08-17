@@ -37,12 +37,25 @@ SGLANG_ENTRY="${SGLANG_ENTRY:-python3 -m sglang.launch_server}"
 command -v docker >/dev/null 2>&1 || { echo "docker is required for the SGLang service" >&2; exit 78; }
 [[ -d "$HOST_HF_HOME" ]] || { echo "missing Hugging Face home: $HOST_HF_HOME" >&2; exit 78; }
 
-# The NVIDIA container runtime ships on this host but is not registered with
-# Docker by default. Without it the container starts and then fails to see the
-# GPU, which reads as a model bug rather than a host misconfiguration.
-if ! docker info 2>/dev/null | grep -q 'nvidia'; then
-  echo "docker has no nvidia runtime registered" >&2
-  echo "run: sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker" >&2
+# Without GPU passthrough the container starts and then fails to see the GPU,
+# which reads as a model bug rather than a host misconfiguration.
+#
+# Two mechanisms satisfy this. Docker 29 on this host exposes the GPU through
+# CDI (`cdi: nvidia.com/gpu=all` in `docker info`), so `--gpus all` resolves
+# without the legacy nvidia runtime being registered at all. Accept either.
+#
+# Match specifically. A bare `grep nvidia` over `docker info` is a false pass:
+# `Kernel Version: 6.17.0-1029-nvidia` matches on a host with no GPU support
+# whatsoever, which is exactly the case this guard exists to catch.
+docker_info=$(docker info 2>/dev/null || true)
+if ! grep -qE '^\s*cdi: nvidia\.com/gpu=all' <<<"$docker_info" &&
+   ! grep -qE '^\s*Runtimes:.*\bnvidia\b' <<<"$docker_info"; then
+  echo "docker cannot pass through the NVIDIA GPU: no CDI device and no nvidia runtime" >&2
+  echo "check: docker info | grep -E 'cdi:|Runtimes:'" >&2
+  echo "fix (disruptive, restarts docker):" >&2
+  echo "  sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker" >&2
+  echo "fix (non-disruptive, regenerates the CDI spec):" >&2
+  echo "  sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml" >&2
   exit 78
 fi
 

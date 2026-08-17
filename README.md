@@ -137,15 +137,18 @@ allows 30. This is not a hang.
 
 ### Docker prerequisite
 
-`nvidia-container-toolkit` is installed but Docker does not register the runtime by default:
+The legacy `nvidia` runtime is **not** registered with Docker here, and does not need to be.
+Docker 29 exposes the GPU through CDI instead — `docker info` lists `cdi: nvidia.com/gpu=all`
+from `/var/run/cdi/nvidia.yaml` — so plain `--gpus all` resolves without any daemon change.
+Verified: `docker run --rm --gpus all ubuntu:24.04 nvidia-smi -L` prints the GB10.
 
-```bash
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker   # bounces Asset Forge containers
-```
+This means **no `nvidia-ctk runtime configure` and no `systemctl restart docker`** — the
+Asset Forge containers never need to be bounced to run this service.
 
-The launcher checks for this and exits 78 with the fix rather than failing obscurely inside
-the container.
+The launcher checks passthrough and exits 78 with the fix rather than failing obscurely
+inside the container. It matches `cdi: nvidia.com/gpu=all` or a real `Runtimes: … nvidia`
+entry specifically — a bare `grep nvidia` over `docker info` is a false pass, since
+`Kernel Version: 6.17.0-1029-nvidia` matches on a host with no GPU support at all.
 
 ### Acceptance
 
