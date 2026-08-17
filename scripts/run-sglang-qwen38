@@ -19,6 +19,23 @@ DGX_GPU_RUN="${DGX_GPU_RUN:-$HOME/ai-agent-os/bin/dgx-gpu-run}"
 # num_nextn_predict_layers, so it has no MTP heads to drive.
 SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:qwen38-27b}"
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-sglang}"
+# These names are wire formats, not model generations. `qwen3_coder` is the XML
+# tool syntax (<tool_call><function=name><parameter=x>) that Qwen3.8's own
+# chat_template.jinja emits, and `qwen3` is its <think> reasoning format -- both
+# verified by reading the checkpoint template, not by matching version numbers.
+#
+# Both flags MUST be passed explicitly. SGLang logs
+#   Auto-detected template features: reasoning_parser=qwen3, tool_call_parser=qwen3_coder
+# but that line is diagnostic only: it does NOT apply them. Measured with the
+# flags omitted, the server returns the raw XML call inside `content` with
+# `tool_calls: []`, and leaves a literal `</think>` inline because the reasoning
+# parser is equally inactive.
+#
+# Getting the value wrong is worse than omitting it: an earlier hand-picked
+# `qwen25` matched the opening <tool_call> tag, failed to parse XML as JSON, and
+# returned HTTP 200 with empty content -- a silent break of every agent harness.
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_coder}"
+REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 
 MODEL_ID="${MODEL_ID:-RadixArk/Qwen3.8-27B-NVFP4}"
 MODEL_REVISION="${MODEL_REVISION:-52d1adc5f38aa5ebf099c29ed7025ba34cfbb854}"
@@ -130,6 +147,8 @@ server_args=(
   --enable-torch-compile
   --torch-compile-max-bs "$TORCH_COMPILE_MAX_BS"
   --trust-remote-code
+  --tool-call-parser "$TOOL_CALL_PARSER"
+  --reasoning-parser "$REASONING_PARSER"
 )
 
 if [[ "${QWEN38_SPECULATIVE:-true}" = "true" ]]; then
