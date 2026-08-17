@@ -141,8 +141,17 @@ The launcher refuses unsafe values rather than starting a service that looks hea
 - **`--mem-fraction-static 0.50`.** Higher values either fail CUDA graph capture or fall back
   to eager mode *silently*, costing roughly 25% throughput with no error. Override only via
   `QWEN38_ALLOW_LARGER_MEM_FRACTION=true` under a monitored gate.
-- **Context 65,536**, not the native 262,144. Promotion is a separate measured gate
-  (`QWEN38_ALLOW_LARGER_CONTEXT=true`), matching the Laguna `safe_initial_model_len` rule.
+- **Context 262,144** — the model's native maximum, promoted from 65,536 on 2026-08-17
+  after a measured gate (`acceptance/qwen38-27b-context-262144-20260817.json`).
+  The promotion was nearly free because the KV pool is sized from `mem-fraction-static`
+  at startup and is independent of context length: it did not shrink (408,653 -> 416,882
+  tokens), and the 1.6 GB that went away was CUDA graph capture. Needle retrieval was
+  exact at 231,822 tokens with `MemAvailable` never below 38.63 GiB against a 20 GiB floor.
+  The binding cost is *time*, not memory: prefill runs 851-1,070 tok/s, so a full-window
+  prompt is ~4.5 minutes before the first output token. Keep the stable part of a repeated
+  prompt first so the radix cache can reuse the prefix across retries.
+  `QWEN38_ALLOW_LARGER_CONTEXT=true` now only gates going *beyond* native, which would
+  need RoPE scaling this service does not configure.
 - **`HF_HUB_OFFLINE=1` is rejected.** SGLang performs a remote probe at startup and hard-fails
   offline even with every weight cached.
 - **Container capped at `--memory=100g`**, matching the systemd budget, and removed via

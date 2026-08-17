@@ -1,0 +1,61 @@
+{
+  "gate": "context_window_promotion",
+  "date": "2026-08-17",
+  "service": "sglang-qwen38-nvfp4.service",
+  "change": {
+    "from": 65536,
+    "to": 262144,
+    "basis": "model native maximum; no RoPE scaling configured"
+  },
+  "kv_pool_tokens": {
+    "at_65536": 408653,
+    "at_262144": 416882,
+    "note": "pool did not shrink; sized from mem_fraction_static, not context_length"
+  },
+  "available_gpu_mem_gb": {
+    "at_65536": 42.51,
+    "at_262144": 40.89,
+    "delta_gb": -1.62,
+    "attributed_to": "CUDA graph capture, not KV cache"
+  },
+  "memory_floor_gib": {
+    "during_gate_load_and_probe": 38.63,
+    "during_final_restart": 38.7,
+    "runtime_floor_limit": 20
+  },
+  "long_context_probe": {
+    "method": "needle-in-haystack over varied numbered records; NOT repeated filler, which SGLang's radix cache would collapse into an unrepresentative prefill cost",
+    "results": [
+      {
+        "prompt_tokens": 99419,
+        "needle_depth": 0.75,
+        "found": true,
+        "wall_clock_s": 92.9,
+        "prefill_tokens_per_s": 1070.0
+      },
+      {
+        "prompt_tokens": 231822,
+        "needle_depth": 0.5,
+        "found": true,
+        "wall_clock_s": 272.6,
+        "prefill_tokens_per_s": 850.5
+      },
+      {
+        "prompt_tokens": 314569,
+        "expected": "rejection",
+        "http_status": 400,
+        "message": "The input (314569 tokens) is longer than the model's context length (262144 tokens)",
+        "note": "allow_auto_truncate=False, so oversize prompts fail loudly rather than being silently truncated"
+      }
+    ]
+  },
+  "operational_consequence": {
+    "binding_cost": "prefill time, not memory",
+    "detail": "at 851-1070 tok/s a full-window prompt costs ~4.5 min before the first output token; repeated retries against a large prompt should keep the stable prefix first so the radix cache can reuse it",
+    "concurrency": "max_running_requests=6, capped by the mamba state cache (34 slots, 5 per request); one 262144-token request occupies 63% of the KV pool, so full-window use is effectively single-request"
+  },
+  "not_measured": [
+    "decode throughput and DSpark acceptance length AT long context: each probe generated only 13 tokens, below SGLang's decode_log_interval=40, so no telemetry was emitted. Prior 28-48 tok/s figures were all taken at 2-5k context and should not be assumed to hold at 200k+."
+  ],
+  "final_server_line": "max_total_num_tokens=410702, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=6, context_len=262144, available_gpu_mem=41.18 GB"
+}

@@ -18,7 +18,7 @@ Keep the local LLM stack lean:
    - Role: `qwen38`. Dense 27B hybrid (Gated DeltaNet + Gated Attention), multimodal,
      Apache 2.0, 262,144 native context, released 2026-08-14.
    - Served by SGLang image `qwen38-27b` on `:8171`, DSpark speculative decoding with
-     block size 7, `flashinfer` attention, `mem-fraction-static 0.50`, context 65,536.
+     block size 7, `flashinfer` attention, `mem-fraction-static 0.50`, context 262,144.
    - **Not** a standing service: `Conflicts=` with Laguna, started on demand via
      `llm-switch qwen38`. This does not violate the one-heavyweight-checkpoint rule.
    - Engine choice follows the model card, which names SGLang and documents the DSpark
@@ -28,8 +28,11 @@ Keep the local LLM stack lean:
      `dspark` and `dflash`, so it is a viable alternative runtime, not an excluded one.
      The archived llama.cpp trees stay available if
      that ever needs rechecking locally.
-   - Requalify separately: context above 65,536, and `mem-fraction-static` above 0.50. The
-     latter is dangerous precisely because it fails quietly into eager mode.
+   - Context was promoted 65,536 -> 262,144 (native) on 2026-08-17 behind a measured gate;
+     see `acceptance/qwen38-27b-context-262144-20260817.json`. It was close to free because
+     the KV pool is sized from `mem-fraction-static`, not from context length.
+   - Requalify separately: `mem-fraction-static` above 0.50. That one is dangerous precisely
+     because it fails quietly into eager mode.
 
 3. Do not add another resident coding or reasoning checkpoint by default.
    - Hosted `architect`, `implementer`, `mechanical`, and `adversary` profiles remain authoritative for Agent OS roles.

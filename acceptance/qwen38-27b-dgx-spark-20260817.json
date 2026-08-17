@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "status": "accepted_on_dgx_spark",
-  "recorded_at": "2026-08-17T12:49:02-0700",
+  "recorded_at": "2026-08-17T16:33:50-0700",
   "runtime": {
     "engine": "sglang",
     "image": "lmsysorg/sglang:qwen38-27b",
@@ -17,30 +17,30 @@
   },
   "performance": {
     "math_reasoning": {
-      "ttft_seconds": 0.1364,
-      "completion_tokens": 465,
-      "wall_seconds": 11.7506,
-      "decode_tokens_per_second": 40.04
+      "ttft_seconds": 0.535,
+      "completion_tokens": 450,
+      "wall_seconds": 11.4994,
+      "decode_tokens_per_second": 41.04
     },
     "code": {
-      "ttft_seconds": 0.2077,
+      "ttft_seconds": 0.2225,
       "completion_tokens": 512,
-      "wall_seconds": 18.4666,
-      "decode_tokens_per_second": 28.04
+      "wall_seconds": 17.9262,
+      "decode_tokens_per_second": 28.92
     },
     "prose": {
-      "ttft_seconds": 0.2037,
-      "completion_tokens": 398,
-      "wall_seconds": 23.4946,
-      "decode_tokens_per_second": 17.09
+      "ttft_seconds": 0.2169,
+      "completion_tokens": 368,
+      "wall_seconds": 20.1536,
+      "decode_tokens_per_second": 18.46
     }
   },
   "observations": {
-    "min_mem_available_gib": 41.24,
+    "min_mem_available_gib": 39.61,
     "vision_response": "\n\nRed",
     "tool_calls": [
       {
-        "id": "call_f262518d6d9f4ba88160973d",
+        "id": "call_63c21ab6f91b461a8e3b9525",
         "index": 0,
         "type": "function",
         "function": {
