@@ -1,15 +1,17 @@
 [Unit]
 Description=SGLang Qwen3.8-27B NVFP4 with DSpark on 8171
-After=network-online.target docker.service
+After=network-online.target
 Wants=network-online.target
-Requires=docker.service
+# No Requires=docker.service: this is a user unit and docker.service is a
+# system unit, so the reference does not resolve and the unit refuses to
+# start. The launcher validates docker and GPU passthrough itself, exit 78.
 
 [Service]
 Type=simple
 Environment="HF_HOME=%h/models/huggingface"
 Environment="HOST_HF_HOME=%h/models/huggingface"
 Environment="CONTAINER_HF_HOME=/models/huggingface"
-Environment="SGLANG_IMAGE=lmsysorg/sglang:v0.5.10.post1-cu130"
+Environment="SGLANG_IMAGE=lmsysorg/sglang:qwen38-27b"
 Environment="CONTAINER_NAME=qwen38-sglang"
 Environment="MODEL_ID=RadixArk/Qwen3.8-27B-NVFP4"
 Environment="MODEL_REVISION=52d1adc5f38aa5ebf099c29ed7025ba34cfbb854"

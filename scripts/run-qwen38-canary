@@ -222,7 +222,7 @@ document = {
     "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     "runtime": {
         "engine": "sglang",
-        "image": "lmsysorg/sglang:v0.5.10.post1-cu130",
+        "image": "lmsysorg/sglang:qwen38-27b",
         "model_id": "RadixArk/Qwen3.8-27B-NVFP4",
         "model_revision": "52d1adc5f38aa5ebf099c29ed7025ba34cfbb854",
         "draft_model_id": "RadixArk/Qwen3.8-27B-DSpark",

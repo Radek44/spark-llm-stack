@@ -17,7 +17,7 @@ Keep the local LLM stack lean:
      `923ed3a8572615643f0137e424e4ce4edd7f1cda`.
    - Role: `qwen38`. Dense 27B hybrid (Gated DeltaNet + Gated Attention), multimodal,
      Apache 2.0, 262,144 native context, released 2026-08-14.
-   - Served by SGLang `v0.5.10.post1-cu130` on `:8171`, DSpark speculative decoding with
+   - Served by SGLang image `qwen38-27b` on `:8171`, DSpark speculative decoding with
      block size 7, `flashinfer` attention, `mem-fraction-static 0.50`, context 65,536.
    - **Not** a standing service: `Conflicts=` with Laguna, started on demand via
      `llm-switch qwen38`. This does not violate the one-heavyweight-checkpoint rule.

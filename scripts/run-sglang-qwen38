@@ -9,7 +9,15 @@ set -euo pipefail
 # attention backend; both are Hopper-tuned and must not be copied here.
 
 DGX_GPU_RUN="${DGX_GPU_RUN:-$HOME/ai-agent-os/bin/dgx-gpu-run}"
-SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:v0.5.10.post1-cu130}"
+# The qwen38-27b tag, not a numbered release. The stable images through
+# v0.5.10.post1-cu130 only offer EAGLE/EAGLE3/NEXTN/STANDALONE/NGRAM and reject
+# DSPARK outright; this tag ships DFLASH and DSPARK, and lmsys published it
+# alongside the model. Verified linux/arm64, torch 2.13+cu130, sm_120 cubins
+# (forward-compatible with the GB10's sm_121).
+#
+# NEXTN is not a fallback here: this NVFP4 checkpoint carries no
+# num_nextn_predict_layers, so it has no MTP heads to drive.
+SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:qwen38-27b}"
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-sglang}"
 
 MODEL_ID="${MODEL_ID:-RadixArk/Qwen3.8-27B-NVFP4}"
