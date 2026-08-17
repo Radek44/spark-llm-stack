@@ -16,7 +16,7 @@
           "name": "Qwen3.8-27B NVFP4 + DSpark (SGLang, spark:8171)",
           "reasoning": true,
           "input": ["text", "image"],
-          "contextWindow": 65536,
+          "contextWindow": 262144,
           "maxTokens": 16384,
           "samplingParams": {
             "temperature": 1.0,

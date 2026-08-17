@@ -44,8 +44,8 @@ DRAFT_MODEL_REVISION="${DRAFT_MODEL_REVISION:-923ed3a8572615643f0137e424e4ce4edd
 
 MODEL_PORT="${MODEL_PORT:-8171}"
 SERVED_MODEL="${SERVED_MODEL:-qwen38}"
-CONTEXT_LENGTH="${CONTEXT_LENGTH:-65536}"
-CONTEXT_LENGTH_SAFE_MAX=65536
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
+CONTEXT_LENGTH_SAFE_MAX=262144
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.50}"
 MEM_FRACTION_STATIC_SAFE_MAX=0.50
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-7}"
@@ -90,7 +90,8 @@ fi
 }
 if (( CONTEXT_LENGTH > CONTEXT_LENGTH_SAFE_MAX )) && \
    [[ "${QWEN38_ALLOW_LARGER_CONTEXT:-false}" != "true" ]]; then
-  echo "CONTEXT_LENGTH exceeds the ${CONTEXT_LENGTH_SAFE_MAX}-token DGX Spark safety cap" >&2
+  echo "CONTEXT_LENGTH exceeds the ${CONTEXT_LENGTH_SAFE_MAX}-token native window" >&2
+  echo "beyond native requires RoPE scaling, which this service does not configure" >&2
   echo "set QWEN38_ALLOW_LARGER_CONTEXT=true only for a separately monitored promotion gate" >&2
   exit 78
 fi
