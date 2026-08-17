@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # llm-switch v5 — lean DGX Spark AI service switcher
 # Runtime:
-#   llm-switch [fast_local|imagine|comfyui|litellm]
+#   llm-switch [fast_local|qwen38|imagine|comfyui|litellm]
 #   llm-switch off | all-off
 #   llm-switch status
 # Boot:
@@ -12,36 +12,45 @@
 
 set -euo pipefail
 
-SLOTS=(fast_local imagine comfyui litellm)
-MODEL_SLOTS=(fast_local imagine comfyui)
+SLOTS=(fast_local qwen38 imagine comfyui litellm)
+MODEL_SLOTS=(fast_local qwen38 imagine comfyui)
 
 declare -A SVCS=(
   [fast_local]="vllm-laguna-s21-nvfp4.service"
+  [qwen38]="sglang-qwen38-nvfp4.service"
   [imagine]="flux-klein.service"
   [comfyui]="comfyui.service"
   [litellm]="litellm.service"
 )
 declare -A PORTS=(
-  [fast_local]=8170 [imagine]=8160 [comfyui]=8188 [litellm]=8180
+  [fast_local]=8170 [qwen38]=8171 [imagine]=8160 [comfyui]=8188 [litellm]=8180
 )
 declare -A ROLES=(
   [fast_local]="vLLM Laguna S 2.1 NVFP4 + DFlash local agent"
+  [qwen38]="SGLang Qwen3.8-27B NVFP4 + DSpark local agent"
   [imagine]="FLUX.2-klein direct image generation"
   [comfyui]="ComfyUI diffusion workflows"
   [litellm]="LiteLLM local routing gateway"
 )
 declare -A MIN_MEM_KIB=(
   [fast_local]=115000000
+  [qwen38]=115000000
   [imagine]=12000000
   [comfyui]=100000000
   [litellm]=2000000
 )
 WAIT_TIMEOUT_DEFAULT=300
-WAIT_TIMEOUT_LAGUNA=1200
+# Heavyweight checkpoints load slowly. Qwen3.8 also pays a one-time
+# torch.compile + CUDA graph capture cost of roughly nine minutes on a cold
+# cache, so it needs the same long window Laguna gets.
+declare -A WAIT_TIMEOUT=(
+  [fast_local]=1200
+  [qwen38]=1200
+)
 
 wait_ready() {
-  local slot=$1 port=${PORTS[$1]} elapsed=0 timeout=$WAIT_TIMEOUT_DEFAULT
-  [[ "$slot" = "fast_local" ]] && timeout=$WAIT_TIMEOUT_LAGUNA
+  local slot=$1 port=${PORTS[$1]} elapsed=0
+  local timeout=${WAIT_TIMEOUT[$slot]:-$WAIT_TIMEOUT_DEFAULT}
   echo -n "  waiting for $slot on :$port"
   while ! curl -sf "http://127.0.0.1:$port/health" > /dev/null 2>&1 \
       && ! curl -sf "http://127.0.0.1:$port/v1/models" > /dev/null 2>&1 \
@@ -237,7 +246,7 @@ boot_status() {
 CMD="${1:-status}"
 
 case "$CMD" in
-  fast_local|imagine|comfyui|litellm)
+  fast_local|qwen38|imagine|comfyui|litellm)
     target_svc="${SVCS[$CMD]}"
     echo "→ $CMD mode (${ROLES[$CMD]})"
     if [ "$CMD" != "litellm" ]; then
@@ -289,6 +298,7 @@ llm-switch v5 — lean DGX Spark AI service switcher
 
 Runtime:
   llm-switch fast_local    start Laguna S 2.1 through vLLM
+  llm-switch qwen38        start Qwen3.8-27B through SGLang (stops Laguna)
   llm-switch litellm       start LiteLLM router without stopping models
   llm-switch imagine       start FLUX.2-klein direct image service
   llm-switch comfyui       start ComfyUI

@@ -28,6 +28,7 @@ MARKER="# managed-by:harden-llm-stack"
 # format: unit | MemoryHigh | MemoryMax | MemorySwapMax | heavyweight (1 = in Conflicts pool)
 SERVICES=(
   "vllm-laguna-s21-nvfp4.service|100G|108G|0|1"
+  "sglang-qwen38-nvfp4.service|100G|108G|0|1"
   "flux-klein.service|12G|16G|0|1"
   "comfyui.service|76G|84G|0|1"
   "litellm.service|2G|4G|512M|0"
@@ -167,7 +168,7 @@ echo
 cat <<'EOF'
 Next: verify the drop-ins took effect.
 
-  for u in vllm-laguna-s21-nvfp4 flux-klein comfyui litellm; do
+  for u in vllm-laguna-s21-nvfp4 sglang-qwen38-nvfp4 flux-klein comfyui litellm; do
     echo "=== $u ==="
     systemctl --user show "$u" -p MemoryHigh,MemoryMax,MemorySwapMax,OOMPolicy,Restart,StartLimitBurst,Conflicts | sed 's/^/  /'
   done

@@ -23,8 +23,11 @@ Current target: **Laguna S 2.1 + vLLM + LiteLLM + Hermes**, with DFlash speculat
 DGX Spark
 ├── vLLM                         # primary local model serving
 │   └── poolside/Laguna-S-2.1-NVFP4 on :8170  (fast_local/private_local)
+├── SGLang                       # alternate local model, mutually exclusive
+│   └── RadixArk/Qwen3.8-27B-NVFP4 + DSpark on :8171  (qwen38)
 ├── LiteLLM                      # local router on :8180
 │   ├── fast_local / private_local
+│   ├── qwen38
 │   └── optional explicit frontier/API aliases
 ├── Hermes Agent                 # CLI/TUI/Desktop/gateway/cron/memory/skills
 ├── FLUX.2-klein direct service  # image generation on :8160
@@ -41,6 +44,7 @@ Do not expose model endpoints on the LAN by default. Service templates bind to `
 | Slot | Service | Model / app | Port | Role |
 |---|---|---|---:|---|
 | `fast_local` | `vllm-laguna-s21-nvfp4.service` | `poolside/Laguna-S-2.1-NVFP4` + DFlash | 8170 | Primary local LLM |
+| `qwen38` | `sglang-qwen38-nvfp4.service` | `RadixArk/Qwen3.8-27B-NVFP4` + DSpark | 8171 | Alternate local LLM (conflicts with `fast_local`) |
 | `litellm` | `litellm.service` | LiteLLM router | 8180 | Unified model gateway |
 | `imagine` | `flux-klein.service` | `black-forest-labs/FLUX.2-klein-4B` | 8160 | Direct image generation |
 | `comfyui` | `comfyui.service` | existing ComfyUI install | 8188 | Diffusion workflows |
@@ -81,6 +85,126 @@ Laguna uses its matched DFlash draft model, not Qwen-style MTP. The accepted ser
 
 ---
 
+## SGLang Qwen3.8-27B service
+
+Template: `sglang-qwen38-nvfp4.service`. Launcher: `scripts/run-sglang-qwen38`.
+
+```text
+http://127.0.0.1:8171/v1
+served model alias: qwen38
+model: RadixArk/Qwen3.8-27B-NVFP4  (pinned 52d1adc5...)
+draft: RadixArk/Qwen3.8-27B-DSpark (pinned 923ed3a8..., 1.36B BF16)
+```
+
+Qwen3.8-27B is a dense 27B hybrid (Gated DeltaNet + Gated Attention, 64 layers), multimodal,
+Apache 2.0, 262,144 native context.
+
+### Why SGLang and not llama.cpp + MTP
+
+Qwen3.8 ships trained MTP heads, and llama.cpp gained `--spec-type draft-mtp` support that
+gives +33-39% decode on consumer cards. That advantage does not transfer to GB10, which has
+native FP4 tensor cores that the NVFP4 path uses and the GGUF path does not:
+
+| Stack | Decode (batch-1) |
+|---|---:|
+| SGLang + NVFP4 + DSpark | 34-47 tok/s |
+| llama.cpp + MTP | ~27 tok/s |
+| vLLM 0.27 + MTP | ~24.5 tok/s |
+
+Decode rate is strongly content-dependent — math/reasoning 42-47, code 26-41, free prose
+12-18 tok/s — because DSpark acceptance varies with how predictable the text is. Non-English
+prose degrades sharply (German drops to roughly 1.3-1.5 accepted tokens per verify step
+against 4.4-4.8 for structured English). Benchmark on your own workload, not on a headline.
+
+### Configuration constraints
+
+The launcher refuses unsafe values rather than starting a service that looks healthy:
+
+- **`--attention-backend flashinfer`, not `fa3`.** The generic SGLang cookbook selects `fa3`
+  plus the FP8 checkpoint; both are Hopper-tuned and are the wrong choice on sm_121.
+- **`--mem-fraction-static 0.50`.** Higher values either fail CUDA graph capture or fall back
+  to eager mode *silently*, costing roughly 25% throughput with no error. Override only via
+  `QWEN38_ALLOW_LARGER_MEM_FRACTION=true` under a monitored gate.
+- **Context 65,536**, not the native 262,144. Promotion is a separate measured gate
+  (`QWEN38_ALLOW_LARGER_CONTEXT=true`), matching the Laguna `safe_initial_model_len` rule.
+- **`HF_HUB_OFFLINE=1` is rejected.** SGLang performs a remote probe at startup and hard-fails
+  offline even with every weight cached.
+- **Container capped at `--memory=100g`**, matching the systemd budget, and removed via
+  `ExecStopPost` so a stray container cannot hold the GPU after the slot reads as free.
+
+Cold start takes roughly nine minutes for torch.compile plus CUDA graph capture; the unit
+allows 30. This is not a hang.
+
+### Docker prerequisite
+
+`nvidia-container-toolkit` is installed but Docker does not register the runtime by default:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker   # bounces Asset Forge containers
+```
+
+The launcher checks for this and exits 78 with the fix rather than failing obscurely inside
+the container.
+
+### Acceptance
+
+```bash
+llm-switch qwen38
+scripts/run-qwen38-canary          # live: measures, writes acceptance/*.json, asserts floors
+scripts/validate-qwen38-acceptance # replay: re-checks a recorded report and its journal
+```
+
+The canary asserts a decode floor rather than just HTTP 200, because the eager-mode fallback
+is silent. It also exercises tool calls, thinking mode, vision, LiteLLM routing, and the two
+known chat-template breakages for OpenAI-compatible clients (mid-conversation system messages
+and `reasoning_effort: high`) — both of which the Pi harness triggers.
+
+### Pi harness (runs on the Mac, not here)
+
+Pi is a BYOK CLI coding agent driving this stack over an SSH tunnel. The router binds
+`127.0.0.1` only, so the tunnel is the sole path in — add to the Mac's `~/.ssh/config`:
+
+```
+Host spark
+  LocalForward 8180 127.0.0.1:8180
+  ExitOnForwardFailure no        # a second ssh session must not fail on a busy port
+```
+
+Then `~/.pi/agent/models.json` on the Mac defines one `litellm` provider at
+`http://127.0.0.1:8180/v1` with `qwen38`, `fast_local`, and `private_local`.
+(`small_coder` is gone — that route was disabled and unreachable on `:8190`.)
+
+The `reasoning_effort` breakage is fixed **client-side**, not by patching the chat template.
+Pi's `thinkingFormat: "chat-template"` moves the field out of the top-level OpenAI body and
+into `chat_template_kwargs`, where Qwen3.8's template accepts it:
+
+```json
+"compat": {
+  "supportsReasoningEffort": false,
+  "thinkingFormat": "chat-template",
+  "chatTemplateKwargs": {
+    "enable_thinking":  { "$var": "thinking.enabled" },
+    "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true }
+  }
+}
+```
+
+A `thinkingLevelMap` also clamps Pi's `xhigh`/`max` levels down to the `low|medium|high` the
+model actually understands. Preferring the client fix keeps the checkpoint stock, so a model
+revision bump does not silently re-break the harness.
+
+Sampling follows the model card: thinking `temp 1.0 / top_p 0.95 / top_k 20`; the instruct
+profile is `temp 0.7 / top_p 0.80 / top_k 20 / presence_penalty 1.5`. The config carries the
+thinking profile, since `reasoning: true` is the default path for agent work.
+
+```bash
+ssh -fN spark        # bring the tunnel up
+pi --provider litellm --model qwen38
+```
+
+---
+
 ## LiteLLM gateway
 
 Template service: `litellm.service`.
@@ -92,8 +216,13 @@ Recommended aliases:
 |---|---|---|
 | `fast_local` | vLLM Laguna S 2.1 NVFP4 on `:8170` | No |
 | `private_local` | same local-only route for private docs/data | No |
+| `qwen38` | SGLang Qwen3.8-27B NVFP4 on `:8171` | No |
 | `code_frontier` | OpenAI API, only if configured privately | Explicit only |
 | `claude_frontier` | Anthropic API, only if configured privately | Explicit only |
+
+`fast_local`/`private_local` and `qwen38` are mutually exclusive: only one heavyweight
+checkpoint runs at a time, so exactly one of `:8170` and `:8171` answers. Requests to the
+idle alias fail rather than silently rerouting. Switch with `llm-switch`.
 
 Do not silently fall back from private/local aliases to cloud providers.
 The router uses a 1,200-second local inference timeout and does not silently drop unsupported request parameters; thinking and tool controls must either reach vLLM or fail visibly.
@@ -104,7 +233,8 @@ The router uses a 1,200-second local inference timeout and does not silently dro
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp vllm-laguna-s21-nvfp4.service litellm.service flux-klein.service comfyui.service \
+cp vllm-laguna-s21-nvfp4.service sglang-qwen38-nvfp4.service litellm.service \
+  flux-klein.service comfyui.service \
   ~/.config/systemd/user/
 
 for d in drop-ins/*/; do
@@ -125,6 +255,7 @@ systemctl --user daemon-reload
 
 ```bash
 llm-switch fast_local    # vLLM Laguna S 2.1 NVFP4 + matched DFlash
+llm-switch qwen38        # SGLang Qwen3.8-27B NVFP4 + DSpark (stops Laguna)
 llm-switch litellm       # LiteLLM router; does not stop model services
 llm-switch imagine       # FLUX.2-klein image generation
 llm-switch comfyui       # ComfyUI workflows
@@ -189,6 +320,7 @@ Each managed service gets:
 | Service | MemoryHigh | MemoryMax | MemorySwapMax |
 |---|---:|---:|---:|
 | `vllm-laguna-s21-nvfp4` | 100G | 108G | 0 |
+| `sglang-qwen38-nvfp4` | 100G | 108G | 0 |
 | `comfyui` | 76G | 84G | 0 |
 | `flux-klein` | 12G | 16G | 1G |
 | `litellm` | 2G | 4G | 512M |

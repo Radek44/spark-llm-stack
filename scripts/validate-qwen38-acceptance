@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Replay validation for a recorded Qwen3.8-27B acceptance report.
+#
+# `run-qwen38-canary` produces the report live; this re-checks it later without
+# needing the service up, and cross-checks the journal window it covers. Same
+# split as validate-laguna-acceptance.
+#
+# usage: validate-qwen38-acceptance [report.json]
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+if [[ -n "${1:-}" ]]; then
+  report="$1"
+else
+  report=$(ls -1t "$repo_root"/acceptance/qwen38-27b-dgx-spark-*.json 2>/dev/null | head -1 || true)
+fi
+[[ -n "$report" && -f "$report" ]] || {
+  echo "no Qwen3.8 acceptance report found; run scripts/run-qwen38-canary first" >&2
+  exit 1
+}
+
+python3 -m json.tool "$report" >/dev/null
+python3 - "$report" <<'PY'
+import json, sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert report["schema_version"] == 1, "unexpected schema version"
+assert report["status"] == "accepted_on_dgx_spark", f"status is {report['status']}"
+
+runtime = report["runtime"]
+assert runtime["engine"] == "sglang"
+assert runtime["model_id"] == "RadixArk/Qwen3.8-27B-NVFP4"
+assert runtime["model_revision"] == "52d1adc5f38aa5ebf099c29ed7025ba34cfbb854"
+assert runtime["draft_model_revision"] == "923ed3a8572615643f0137e424e4ce4edd7f1cda"
+assert runtime["speculative_algorithm"] == "DSPARK"
+assert runtime["dspark_block_size"] == 7
+# The two settings that silently degrade rather than fail loudly.
+assert runtime["attention_backend"] == "flashinfer", "fa3 is Hopper-tuned; wrong on sm_121"
+assert runtime["mem_fraction_static"] == 0.50, "above 0.50 falls back to eager mode silently"
+assert runtime["context_length"] == 65536
+
+failed = [name for name, ok in report["checks"].items() if not ok]
+assert not failed, f"failed checks: {', '.join(failed)}"
+assert not report.get("errors"), f"recorded errors: {report['errors']}"
+
+floor = report["thresholds"]["min_decode_tokens_per_second"]
+best = max(w["decode_tokens_per_second"] for w in report["performance"].values())
+assert best >= floor, f"best decode {best} tok/s is below the {floor} tok/s floor"
+
+mem = report["observations"]["min_mem_available_gib"]
+assert mem >= 20.0, f"MemAvailable fell to {mem} GiB, below the 20 GiB runtime floor"
+
+print(f"report {sys.argv[1]}")
+print(f"  best decode {best} tok/s, min MemAvailable {mem} GiB, {len(report['checks'])} checks passed")
+PY
+
+# Kernel-level faults inside the recorded window would invalidate the run even
+# if every HTTP check passed.
+recorded_at=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['recorded_at'])" "$report")
+kernel_faults=$(journalctl -k --since "$recorded_at" --no-pager -o cat 2>/dev/null | \
+  rg -i 'oom|out of memory|killed process|nvrm|xid' || true)
+[[ -z "$kernel_faults" ]] || {
+  echo "Qwen3.8 acceptance window contains kernel memory/GPU faults:" >&2
+  printf '%s\n' "$kernel_faults" >&2
+  exit 1
+}
+
+echo "validate-qwen38-acceptance: recorded acceptance evidence passed"
