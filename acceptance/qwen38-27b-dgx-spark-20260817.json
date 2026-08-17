@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "status": "accepted_on_dgx_spark",
+  "recorded_at": "2026-08-17T12:49:02-0700",
+  "runtime": {
+    "engine": "sglang",
+    "image": "lmsysorg/sglang:qwen38-27b",
+    "model_id": "RadixArk/Qwen3.8-27B-NVFP4",
+    "model_revision": "52d1adc5f38aa5ebf099c29ed7025ba34cfbb854",
+    "draft_model_id": "RadixArk/Qwen3.8-27B-DSpark",
+    "draft_model_revision": "923ed3a8572615643f0137e424e4ce4edd7f1cda",
+    "speculative_algorithm": "DSPARK",
+    "dspark_block_size": 7,
+    "attention_backend": "flashinfer",
+    "mem_fraction_static": 0.5,
+    "context_length": 65536
+  },
+  "performance": {
+    "math_reasoning": {
+      "ttft_seconds": 0.1364,
+      "completion_tokens": 465,
+      "wall_seconds": 11.7506,
+      "decode_tokens_per_second": 40.04
+    },
+    "code": {
+      "ttft_seconds": 0.2077,
+      "completion_tokens": 512,
+      "wall_seconds": 18.4666,
+      "decode_tokens_per_second": 28.04
+    },
+    "prose": {
+      "ttft_seconds": 0.2037,
+      "completion_tokens": 398,
+      "wall_seconds": 23.4946,
+      "decode_tokens_per_second": 17.09
+    }
+  },
+  "observations": {
+    "min_mem_available_gib": 41.24,
+    "vision_response": "\n\nRed",
+    "tool_calls": [
+      {
+        "id": "call_f262518d6d9f4ba88160973d",
+        "index": 0,
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\": \"Reykjavik\"}"
+        }
+      }
+    ]
+  },
+  "errors": {
+    "mid_conversation_system_message": "{\"object\":\"error\",\"message\":\"System message must be at the beginning.\",\"type\":\"BadRequest\",\"param\":null,\"code\":400}"
+  },
+  "checks": {
+    "decode_floor": true,
+    "thinking": true,
+    "tool_call": true,
+    "reasoning_effort_max": true,
+    "vision": true,
+    "litellm_routed": true,
+    "runtime_memory_floor": true
+  },
+  "known_limitations": {
+    "mid_conversation_system_message": {
+      "supported": false,
+      "source": "chat_template.jinja raise_exception",
+      "harness_impact": "none observed: Pi sends system only at index 0"
+    }
+  },
+  "thresholds": {
+    "min_decode_tokens_per_second": 30.0,
+    "runtime_memory_floor_gib": 20.0
+  }
+}

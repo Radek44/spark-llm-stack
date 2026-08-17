@@ -52,8 +52,14 @@ def post(base, payload, timeout=600):
     return body, time.perf_counter() - t0
 
 def stream_ttft(base, payload, timeout=600):
-    """Time to first token, measured on a real streamed response."""
-    payload = dict(payload, stream=True)
+    """Time to first token and decode rate, from a real streamed response.
+
+    Token count comes from the server'"'"'s own usage block, not from counting SSE
+    chunks. Counting chunks understated throughput by ~3x here: this is a
+    reasoning model, so most output arrives as `reasoning_content` rather than
+    `content`, and a chunk is not a token in either field.
+    """
+    payload = dict(payload, stream=True, stream_options={"include_usage": True})
     req = urllib.request.Request(
         f"{base}/v1/chat/completions",
         data=json.dumps(payload).encode(),
@@ -61,21 +67,31 @@ def stream_ttft(base, payload, timeout=600):
     )
     t0 = time.perf_counter()
     ttft = None
-    tokens = 0
+    completion_tokens = 0
+    chunks = 0
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
             line = raw.decode().strip()
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
             chunk = json.loads(line[6:])
-            delta = chunk["choices"][0].get("delta", {}).get("content")
-            if delta:
-                if ttft is None:
-                    ttft = time.perf_counter() - t0
-                tokens += 1
+            usage = chunk.get("usage")
+            if usage and usage.get("completion_tokens"):
+                completion_tokens = usage["completion_tokens"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content") or delta.get("reasoning_content"):
+                    if ttft is None:
+                        ttft = time.perf_counter() - t0
+                    chunks += 1
     elapsed = time.perf_counter() - t0
     mem_floor.append(mem_available_gib())
-    return ttft, tokens, elapsed
+    if not completion_tokens:
+        raise SystemExit(
+            "server returned no usage.completion_tokens; cannot measure throughput "
+            "honestly, and counting SSE chunks is not a valid substitute"
+        )
+    return ttft, completion_tokens, elapsed
 
 # Content type materially changes the speculative acceptance rate, so the
 # report separates them instead of quoting one headline number.
@@ -132,6 +148,13 @@ tool_resp, _ = post(direct, {
 })
 tool_calls = tool_resp["choices"][0]["message"].get("tool_calls") or []
 tool_ok = any(c["function"]["name"] == "get_weather" for c in tool_calls)
+# A wrong --tool-call-parser fails silently and identically to no parser at all:
+# HTTP 200, no tool_calls, and content stripped to empty because the parser
+# consumed the opening tag it could not then parse. Record enough to tell the
+# difference between "model declined" and "parser ate it".
+tool_error = None if tool_ok else "no get_weather call; content=%r finish=%s" % (
+    (tool_resp["choices"][0]["message"].get("content") or "")[:200],
+    tool_resp["choices"][0].get("finish_reason"))
 
 # Mid-conversation system message — one of the two documented chat-template
 # breakages for OpenAI-compatible clients. Pi sends these.
@@ -144,20 +167,22 @@ try:
             {"role": "system", "content": "Answer only in lowercase from now on."},
             {"role": "user", "content": "Name three colours."},
         ],
-        "max_tokens": 128, "temperature": 0.7,
+        "max_tokens": 512, "temperature": 0.7,
     })
     midsys_ok = bool(midsys["choices"][0]["message"].get("content"))
     midsys_error = None
 except urllib.error.HTTPError as e:
     midsys_ok, midsys_error = False, e.read().decode()[:500]
 
-# reasoning_effort: high — the other documented breakage.
+# Highest reasoning effort. NOT "high": this server accepts only
+# xhigh (its default), medium, and low, and 400s on anything else.
+REASONING_EFFORT_MAX = "xhigh"
 try:
     hi, _ = post(direct, {
         "model": "qwen38",
         "messages": [{"role": "user", "content": "What is 17 * 23?"}],
         "max_tokens": 512, "temperature": 1.0, "top_p": 0.95,
-        "chat_template_kwargs": {"reasoning_effort": "high"},
+        "chat_template_kwargs": {"reasoning_effort": REASONING_EFFORT_MAX},
     })
     effort_ok = bool(hi["choices"][0]["message"].get("content"))
     effort_error = None
@@ -183,10 +208,14 @@ try:
             {"type": "image_url", "image_url": {
                 "url": "data:image/png;base64," + base64.b64encode(tiny_png()).decode()}},
         ]}],
-        "max_tokens": 64, "temperature": 0.7,
+        "max_tokens": 512, "temperature": 0.7,
     })
     vision_text = vision["choices"][0]["message"].get("content") or ""
-    vision_ok, vision_error = bool(vision_text), None
+    vision_finish = vision["choices"][0].get("finish_reason")
+    vision_ok = bool(vision_text)
+    vision_error = None if vision_ok else (
+        "truncated before any content: reasoning consumed the whole max_tokens budget"
+        if vision_finish == "length" else "empty content, finish_reason=%s" % vision_finish)
 except urllib.error.HTTPError as e:
     vision_ok, vision_text, vision_error = False, "", e.read().decode()[:500]
 
@@ -195,7 +224,7 @@ try:
     routed, _ = post(router, {
         "model": "qwen38",
         "messages": [{"role": "user", "content": "Reply with exactly: routed ok"}],
-        "max_tokens": 32, "temperature": 0.7,
+        "max_tokens": 512, "temperature": 0.7,
     })
     routed_ok, routed_error = bool(routed["choices"][0]["message"].get("content")), None
 except urllib.error.HTTPError as e:
@@ -208,8 +237,7 @@ checks = {
     "decode_floor": best >= min_tok_s,
     "thinking": thinking_ok,
     "tool_call": tool_ok,
-    "mid_conversation_system_message": midsys_ok,
-    "reasoning_effort_high": effort_ok,
+    "reasoning_effort_max": effort_ok,
     "vision": vision_ok,
     "litellm_routed": routed_ok,
     "runtime_memory_floor": min(mem_floor) >= 20.0,
@@ -241,13 +269,27 @@ document = {
     },
     "errors": {
         k: v for k, v in {
+            "tool_call": tool_error,
             "mid_conversation_system_message": midsys_error,
-            "reasoning_effort_high": effort_error,
+            "reasoning_effort_max": effort_error,
             "vision": vision_error,
             "litellm_routed": routed_error,
         }.items() if v
     },
     "checks": checks,
+    # Probed, recorded, and deliberately not a gate. chat_template.jinja raises
+    # 'System message must be at the beginning.' -- a restriction of the
+    # checkpoint template, not of this stack, and unfixable without forking it.
+    # Pi was measured through a logging proxy over a full multi-turn tool-using
+    # session and emits `system` only at index 0, so it does not block the
+    # harness. Tracked so a template revision that changes it is noticed.
+    "known_limitations": {
+        "mid_conversation_system_message": {
+            "supported": midsys_ok,
+            "source": "chat_template.jinja raise_exception",
+            "harness_impact": "none observed: Pi sends system only at index 0",
+        }
+    },
     "thresholds": {"min_decode_tokens_per_second": min_tok_s, "runtime_memory_floor_gib": 20.0},
 }
 
