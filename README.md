@@ -99,17 +99,33 @@ draft: RadixArk/Qwen3.8-27B-DSpark (pinned 923ed3a8..., 1.36B BF16)
 Qwen3.8-27B is a dense 27B hybrid (Gated DeltaNet + Gated Attention, 64 layers), multimodal,
 Apache 2.0, 262,144 native context.
 
-### Why SGLang and not llama.cpp + MTP
+### Why SGLang
 
-Qwen3.8 ships trained MTP heads, and llama.cpp gained `--spec-type draft-mtp` support that
-gives +33-39% decode on consumer cards. That advantage does not transfer to GB10, which has
-native FP4 tensor cores that the NVFP4 path uses and the GGUF path does not:
+The engine was chosen on **supportedness**, not on a benchmark. The NVFP4 model card names
+SGLang as its serving engine, and the DSpark draft card states the speculator was trained
+with SpecForge and is served with SGLang, down to the exact flags. That is the whole
+argument, and it is enough on its own.
 
-| Stack | Decode (batch-1) |
-|---|---:|
-| SGLang + NVFP4 + DSpark | 34-47 tok/s |
-| llama.cpp + MTP | ~27 tok/s |
-| vLLM 0.27 + MTP | ~24.5 tok/s |
+What is **measured here on this GB10**, from the acceptance canary and the engine's own
+telemetry, is the SGLang row only:
+
+| Stack | Decode (batch-1) | Provenance |
+|---|---:|---|
+| SGLang + NVFP4 + DSpark | 27.9-40.6 tok/s | measured on this machine |
+| llama.cpp + MTP | unmeasured | never run here |
+| vLLM + DSpark | unmeasured | supported, never run here |
+
+Two corrections to earlier drafts of this file, recorded so they are not repeated:
+
+- An earlier table quoted llama.cpp+MTP at ~27 tok/s and vLLM+MTP at ~24.5 tok/s as though
+  measured. **They were not measured on this hardware** and should not be cited as if they
+  were. The published NVFP4 benchmarks are on 4x B300/GB300 with TP4, which says nothing
+  about a single GB10.
+- vLLM was described as limited to MTP. That is **false**: vLLM 0.26.0, already installed
+  here and already serving Laguna, implements both `dspark` and `dflash`. vLLM is a
+  legitimate alternative runtime for this checkpoint; it simply is not the one the model
+  card documents, and it has not been benchmarked here. Laguna already runs DFlash on vLLM
+  on this box, so the mechanism is known to work on GB10.
 
 Decode rate is strongly content-dependent — math/reasoning 42-47, code 26-41, free prose
 12-18 tok/s — because DSpark acceptance varies with how predictable the text is. Non-English

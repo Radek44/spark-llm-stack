@@ -21,10 +21,12 @@ Keep the local LLM stack lean:
      block size 7, `flashinfer` attention, `mem-fraction-static 0.50`, context 65,536.
    - **Not** a standing service: `Conflicts=` with Laguna, started on demand via
      `llm-switch qwen38`. This does not violate the one-heavyweight-checkpoint rule.
-   - Engine choice is measured, not assumed. Qwen3.8 ships trained MTP heads and llama.cpp
-     supports them, but MTP's +33-39% is a consumer-GPU result. On GB10 the NVFP4 path wins
-     because the FP4 tensor cores are native: SGLang+NVFP4+DSpark 34-47 tok/s against
-     llama.cpp+MTP ~27 and vLLM+MTP ~24.5. The archived llama.cpp trees stay available if
+   - Engine choice follows the model card, which names SGLang and documents the DSpark
+     flags; it is not a benchmark result. Measured here: SGLang+NVFP4+DSpark runs
+     27.9-40.6 tok/s at parallel 1 on this GB10. llama.cpp+MTP and vLLM+DSpark were never
+     run on this machine and carry no local numbers. Note that vLLM 0.26.0 does implement
+     `dspark` and `dflash`, so it is a viable alternative runtime, not an excluded one.
+     The archived llama.cpp trees stay available if
      that ever needs rechecking locally.
    - Requalify separately: context above 65,536, and `mem-fraction-static` above 0.50. The
      latter is dangerous precisely because it fails quietly into eager mode.
