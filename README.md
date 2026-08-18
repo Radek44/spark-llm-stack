@@ -138,6 +138,22 @@ The launcher refuses unsafe values rather than starting a service that looks hea
 
 - **`--attention-backend flashinfer`, not `fa3`.** The generic SGLang cookbook selects `fa3`
   plus the FP8 checkpoint; both are Hopper-tuned and are the wrong choice on sm_121.
+- **`SGLANG_ENABLE_JIT_DEEPGEMM` is left at its default (on), deliberately.** Advice circulates
+  to set it to `0` on DGX Spark because JIT DeepGEMM can crash on this architecture. The
+  premise is half right: SGLang's own guard excludes `sm_version == 120`, and GB10 reports
+  **121**, so the flag really is enabled here. It is nonetheless inert for this checkpoint.
+  Checked 2026-08-17: the model declares `quant_method: modelopt`, so it loads through
+  `modelopt_quant`, which contains zero `deep_gemm` references; DeepGEMM serves the
+  blockwise-FP8 and MoE grouped-GEMM paths, and this is a dense model with
+  `USE_DEEPGEMM_MEGA_MOE=False` and `USE_DEEPGEMM_BMM=False`. After 20+ hours of uptime and a
+  full canary there is no DeepGEMM JIT cache anywhere on the box -- every compiled `.cubin`
+  under `~/.cache/sglang/triton/` came from the torch.compile path. Setting it to `0` would
+  change nothing measurable, so it is not set. Revisit if the checkpoint ever moves to
+  blockwise FP8 or a MoE architecture.
+
+  Worth knowing when reading that advice: this checkpoint is **not** uniformly NVFP4. It has
+  two quant groups -- 208 targets at FP8 W8A8 (the `linear_attn` / Gated DeltaNet projections)
+  and 193 at NVFP4 W4A4, group size 16.
 - **`--mem-fraction-static 0.50`.** Higher values either fail CUDA graph capture or fall back
   to eager mode *silently*, costing roughly 25% throughput with no error. Override only via
   `QWEN38_ALLOW_LARGER_MEM_FRACTION=true` under a monitored gate.
