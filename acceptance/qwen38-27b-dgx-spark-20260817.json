@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "status": "accepted_on_dgx_spark",
-  "recorded_at": "2026-08-17T16:33:50-0700",
+  "recorded_at": "2026-08-17T18:47:16-0700",
   "runtime": {
     "engine": "sglang",
     "image": "lmsysorg/sglang:qwen38-27b",
@@ -13,34 +13,38 @@
     "dspark_block_size": 7,
     "attention_backend": "flashinfer",
     "mem_fraction_static": 0.5,
-    "context_length": 65536
+    "context_length": 262144,
+    "max_total_num_tokens": 410702,
+    "enable_torch_compile": true,
+    "torch_compile_max_bs": 4,
+    "num_continuous_decode_steps": 2
   },
   "performance": {
     "math_reasoning": {
-      "ttft_seconds": 0.535,
-      "completion_tokens": 450,
-      "wall_seconds": 11.4994,
-      "decode_tokens_per_second": 41.04
+      "ttft_seconds": 0.4617,
+      "completion_tokens": 461,
+      "wall_seconds": 11.3877,
+      "decode_tokens_per_second": 42.19
     },
     "code": {
-      "ttft_seconds": 0.2225,
+      "ttft_seconds": 0.2044,
       "completion_tokens": 512,
-      "wall_seconds": 17.9262,
-      "decode_tokens_per_second": 28.92
+      "wall_seconds": 18.7832,
+      "decode_tokens_per_second": 27.56
     },
     "prose": {
-      "ttft_seconds": 0.2169,
-      "completion_tokens": 368,
-      "wall_seconds": 20.1536,
-      "decode_tokens_per_second": 18.46
+      "ttft_seconds": 0.2042,
+      "completion_tokens": 432,
+      "wall_seconds": 26.5743,
+      "decode_tokens_per_second": 16.38
     }
   },
   "observations": {
-    "min_mem_available_gib": 39.61,
+    "min_mem_available_gib": 41.24,
     "vision_response": "\n\nRed",
     "tool_calls": [
       {
-        "id": "call_63c21ab6f91b461a8e3b9525",
+        "id": "call_dfd52dc4801240fa8ebd4b9e",
         "index": 0,
         "type": "function",
         "function": {
@@ -50,9 +54,7 @@
       }
     ]
   },
-  "errors": {
-    "mid_conversation_system_message": "{\"object\":\"error\",\"message\":\"System message must be at the beginning.\",\"type\":\"BadRequest\",\"param\":null,\"code\":400}"
-  },
+  "errors": {},
   "checks": {
     "decode_floor": true,
     "thinking": true,
@@ -66,7 +68,8 @@
     "mid_conversation_system_message": {
       "supported": false,
       "source": "chat_template.jinja raise_exception",
-      "harness_impact": "none observed: Pi sends system only at index 0"
+      "harness_impact": "none observed: Pi sends system only at index 0",
+      "server_message": "{\"object\":\"error\",\"message\":\"System message must be at the beginning.\",\"type\":\"BadRequest\",\"param\":null,\"code\":400}"
     }
   },
   "thresholds": {

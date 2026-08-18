@@ -26,7 +26,9 @@ python3 - "$report" <<'PY'
 import json, sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
-assert report["schema_version"] == 1, "unexpected schema version"
+# v2 reads the runtime block back from /get_server_info. v1 restated it as
+# literals and cannot be trusted for context_length, so it is not accepted.
+assert report["schema_version"] == 2, "unexpected schema version"
 assert report["status"] == "accepted_on_dgx_spark", f"status is {report['status']}"
 
 runtime = report["runtime"]
@@ -39,7 +41,8 @@ assert runtime["dspark_block_size"] == 7
 # The two settings that silently degrade rather than fail loudly.
 assert runtime["attention_backend"] == "flashinfer", "fa3 is Hopper-tuned; wrong on sm_121"
 assert runtime["mem_fraction_static"] == 0.50, "above 0.50 falls back to eager mode silently"
-assert runtime["context_length"] == 65536
+assert runtime["context_length"] == 262144, "context promoted to native on 2026-08-17"
+assert runtime["max_total_num_tokens"] > 400000, "KV pool shrank"
 
 failed = [name for name, ok in report["checks"].items() if not ok]
 assert not failed, f"failed checks: {', '.join(failed)}"

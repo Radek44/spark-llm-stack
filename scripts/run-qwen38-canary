@@ -39,6 +39,22 @@ def mem_available_gib():
 
 mem_floor = [mem_available_gib()]
 
+
+def server_info():
+    """Live runtime config, so the report describes the server that ran.
+
+    Every field below was previously a literal repeated in this script and
+    again in validate-qwen38-acceptance. That pair agreed with each other
+    and not with the service: the context promotion to 262144 left both
+    saying 65536. Reading it back makes the validator a real check that
+    the running server matched its pins.
+    """
+    with urllib.request.urlopen(f"{direct}/get_server_info", timeout=30) as r:
+        return json.load(r)
+
+
+info = server_info()
+
 def post(base, payload, timeout=600):
     req = urllib.request.Request(
         f"{base}/v1/chat/completions",
@@ -245,21 +261,25 @@ checks = {
 passed = all(checks.values())
 
 document = {
-    "schema_version": 1,
+    "schema_version": 2,
     "status": "accepted_on_dgx_spark" if passed else "failed_acceptance",
     "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     "runtime": {
         "engine": "sglang",
         "image": "lmsysorg/sglang:qwen38-27b",
-        "model_id": "RadixArk/Qwen3.8-27B-NVFP4",
-        "model_revision": "52d1adc5f38aa5ebf099c29ed7025ba34cfbb854",
-        "draft_model_id": "RadixArk/Qwen3.8-27B-DSpark",
-        "draft_model_revision": "923ed3a8572615643f0137e424e4ce4edd7f1cda",
-        "speculative_algorithm": "DSPARK",
-        "dspark_block_size": 7,
-        "attention_backend": "flashinfer",
-        "mem_fraction_static": 0.50,
-        "context_length": 65536,
+        "model_id": info["model_path"],
+        "model_revision": info["revision"],
+        "draft_model_id": info["speculative_draft_model_path"],
+        "draft_model_revision": info["speculative_draft_model_revision"],
+        "speculative_algorithm": info["speculative_algorithm"],
+        "dspark_block_size": info["speculative_dspark_block_size"],
+        "attention_backend": info["attention_backend"],
+        "mem_fraction_static": info["mem_fraction_static"],
+        "context_length": info["context_length"],
+        "max_total_num_tokens": info["max_total_num_tokens"],
+        "enable_torch_compile": info["enable_torch_compile"],
+        "torch_compile_max_bs": info["torch_compile_max_bs"],
+        "num_continuous_decode_steps": info["num_continuous_decode_steps"],
     },
     "performance": results,
     "observations": {
@@ -270,7 +290,6 @@ document = {
     "errors": {
         k: v for k, v in {
             "tool_call": tool_error,
-            "mid_conversation_system_message": midsys_error,
             "reasoning_effort_max": effort_error,
             "vision": vision_error,
             "litellm_routed": routed_error,
@@ -288,6 +307,7 @@ document = {
             "supported": midsys_ok,
             "source": "chat_template.jinja raise_exception",
             "harness_impact": "none observed: Pi sends system only at index 0",
+            "server_message": midsys_error,
         }
     },
     "thresholds": {"min_decode_tokens_per_second": min_tok_s, "runtime_memory_floor_gib": 20.0},
