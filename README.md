@@ -147,9 +147,19 @@ The launcher refuses unsafe values rather than starting a service that looks hea
   at startup and is independent of context length: it did not shrink (408,653 -> 416,882
   tokens), and the 1.6 GB that went away was CUDA graph capture. Needle retrieval was
   exact at 231,822 tokens with `MemAvailable` never below 38.63 GiB against a 20 GiB floor.
-  The binding cost is *time*, not memory: prefill runs 851-1,070 tok/s, so a full-window
-  prompt is ~4.5 minutes before the first output token. Keep the stable part of a repeated
-  prompt first so the radix cache can reuse the prefix across retries.
+  The binding cost is *time*, not memory, and it is concentrated entirely in prefill.
+  Measured 2026-08-17 (`acceptance/qwen38-27b-longcontext-profile-20260817.json`):
+  decode falls only 21.9 -> 16.4 tok/s from 2k to 223k tokens, while prefill throughput
+  falls 2,256 -> 711 tok/s and TTFT goes superlinear (0.9s -> 313s). At 223k, 93% of
+  wall clock is prefill. DSpark acceptance is flat with depth (~2.6), so the slowdown is
+  attention cost, not speculative collapse.
+
+  **So do not minimize prompt size -- minimize prefix churn.** An identical prefix turns
+  98k tokens of prefill into 0.53s, a 171x speedup. Changing a single token near the top
+  of that prompt forfeits all 90 seconds, even with 99.9% of the content unchanged: reuse
+  is near-total but strictly prefix-anchored. Anything that mutates the head of the prompt
+  per attempt -- embedded timestamps, retry counters, elapsed-time banners, reordered tool
+  lists, a rotating system preamble -- pays full prefill every attempt.
   `QWEN38_ALLOW_LARGER_CONTEXT=true` now only gates going *beyond* native, which would
   need RoPE scaling this service does not configure.
 - **`HF_HUB_OFFLINE=1` is rejected.** SGLang performs a remote probe at startup and hard-fails

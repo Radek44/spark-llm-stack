@@ -54,8 +54,9 @@
     "detail": "at 851-1070 tok/s a full-window prompt costs ~4.5 min before the first output token; repeated retries against a large prompt should keep the stable prefix first so the radix cache can reuse it",
     "concurrency": "max_running_requests=6, capped by the mamba state cache (34 slots, 5 per request); one 262144-token request occupies 63% of the KV pool, so full-window use is effectively single-request"
   },
-  "not_measured": [
-    "decode throughput and DSpark acceptance length AT long context: each probe generated only 13 tokens, below SGLang's decode_log_interval=40, so no telemetry was emitted. Prior 28-48 tok/s figures were all taken at 2-5k context and should not be assumed to hold at 200k+."
-  ],
-  "final_server_line": "max_total_num_tokens=410702, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=6, context_len=262144, available_gpu_mem=41.18 GB"
+  "not_measured": [],
+  "final_server_line": "max_total_num_tokens=410702, chunked_prefill_size=8192, max_prefill_tokens=16384, max_running_requests=6, context_len=262144, available_gpu_mem=41.18 GB",
+  "resolved_by": {
+    "decode_and_acceptance_at_long_context": "measured 2026-08-17, see acceptance/qwen38-27b-longcontext-profile-20260817.json: decode 21.9 -> 16.4 tok/s from 2k to 223k, DSpark accept len flat at ~2.6"
+  }
 }
