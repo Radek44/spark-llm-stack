@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Live acceptance canary for Qwen3.8-27B NVFP4 + DSpark on SGLang.
+#
+# Drives the running service, measures it, and writes a JSON acceptance report.
+# `validate-qwen38-acceptance` later replays that report and its journal window,
+# the same split Laguna uses.
+#
+# Requires the service to be up already: llm-switch qwen38
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+stamp=$(date +%Y%m%d)
+report="${QWEN38_REPORT:-$repo_root/acceptance/qwen38-27b-dgx-spark-$stamp.json}"
+
+DIRECT_BASE="${DIRECT_BASE:-http://127.0.0.1:8171}"
+ROUTER_BASE="${ROUTER_BASE:-http://127.0.0.1:8180}"
+# Speculative decoding only pays off at batch 1; the advantage is gone by
+# parallel 4. Measure where the service actually runs.
+MIN_DECODE_TOK_S="${MIN_DECODE_TOK_S:-30}"
+
+curl -fsS --max-time 10 "$DIRECT_BASE/v1/models" >/dev/null || {
+  echo "Qwen3.8 is not serving on $DIRECT_BASE — run: llm-switch qwen38" >&2
+  exit 1
+}
+
+mkdir -p "$(dirname "$report")"
+
+python3 - "$report" "$DIRECT_BASE" "$ROUTER_BASE" "$MIN_DECODE_TOK_S" <<'PY'
+import json, sys, time, urllib.request, urllib.error, base64, struct, zlib, pathlib
+
+report_path, direct, router, min_tok_s = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+
+def mem_available_gib():
+    for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / 1024 / 1024
+    raise SystemExit("MemAvailable missing from /proc/meminfo")
+
+mem_floor = [mem_available_gib()]
+
+
+def server_info():
+    """Live runtime config, so the report describes the server that ran.
+
+    Every field below was previously a literal repeated in this script and
+    again in validate-qwen38-acceptance. That pair agreed with each other
+    and not with the service: the context promotion to 262144 left both
+    saying 65536. Reading it back makes the validator a real check that
+    the running server matched its pins.
+    """
+    with urllib.request.urlopen(f"{direct}/get_server_info", timeout=30) as r:
+        return json.load(r)
+
+
+info = server_info()
+
+def post(base, payload, timeout=600):
+    req = urllib.request.Request(
+        f"{base}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer local-dummy-key"},
+    )
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = json.load(r)
+    mem_floor.append(mem_available_gib())
+    return body, time.perf_counter() - t0
+
+def stream_ttft(base, payload, timeout=600):
+    """Time to first token and decode rate, from a real streamed response.
+
+    Token count comes from the server'"'"'s own usage block, not from counting SSE
+    chunks. Counting chunks understated throughput by ~3x here: this is a
+    reasoning model, so most output arrives as `reasoning_content` rather than
+    `content`, and a chunk is not a token in either field.
+    """
+    payload = dict(payload, stream=True, stream_options={"include_usage": True})
+    req = urllib.request.Request(
+        f"{base}/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer local-dummy-key"},
+    )
+    t0 = time.perf_counter()
+    ttft = None
+    completion_tokens = 0
+    chunks = 0
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for raw in r:
+            line = raw.decode().strip()
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            chunk = json.loads(line[6:])
+            usage = chunk.get("usage")
+            if usage and usage.get("completion_tokens"):
+                completion_tokens = usage["completion_tokens"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content") or delta.get("reasoning_content"):
+                    if ttft is None:
+                        ttft = time.perf_counter() - t0
+                    chunks += 1
+    elapsed = time.perf_counter() - t0
+    mem_floor.append(mem_available_gib())
+    if not completion_tokens:
+        raise SystemExit(
+            "server returned no usage.completion_tokens; cannot measure throughput "
+            "honestly, and counting SSE chunks is not a valid substitute"
+        )
+    return ttft, completion_tokens, elapsed
+
+# Content type materially changes the speculative acceptance rate, so the
+# report separates them instead of quoting one headline number.
+WORKLOADS = {
+    "math_reasoning": "Prove that the sum of the first n odd positive integers equals n squared. Show the induction step explicitly.",
+    "code": "Write a Python function that merges overlapping intervals in O(n log n). Include docstring and three unit tests.",
+    "prose": "Write four paragraphs describing a coastal fishing village waking up on a foggy autumn morning.",
+}
+
+results = {}
+for name, prompt in WORKLOADS.items():
+    payload = {
+        "model": "qwen38",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 512,
+        "temperature": 0.7, "top_p": 0.80,
+    }
+    ttft, tokens, elapsed = stream_ttft(direct, payload)
+    decode_tok_s = tokens / (elapsed - (ttft or 0)) if tokens and elapsed > (ttft or 0) else 0.0
+    results[name] = {
+        "ttft_seconds": round(ttft, 4) if ttft else None,
+        "completion_tokens": tokens,
+        "wall_seconds": round(elapsed, 4),
+        "decode_tokens_per_second": round(decode_tok_s, 2),
+    }
+    print(f"  {name}: {decode_tok_s:.1f} tok/s, ttft {ttft:.3f}s, {tokens} tokens")
+
+# Thinking mode uses its own sampling profile per the model card.
+thinking, _ = post(direct, {
+    "model": "qwen38",
+    "messages": [{"role": "user", "content": "A train leaves at 14:05 travelling 82 km/h. How far by 17:35? Think it through."}],
+    "max_tokens": 1024, "temperature": 1.0, "top_p": 0.95,
+    "chat_template_kwargs": {"reasoning_effort": "medium"},
+})
+thinking_ok = bool(thinking["choices"][0]["message"].get("content"))
+
+# Tool calling — the harness depends on this path, so a 200 is not enough.
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}]
+tool_resp, _ = post(direct, {
+    "model": "qwen38",
+    "messages": [{"role": "user", "content": "What is the weather in Reykjavik right now? Use the tool."}],
+    "tools": tools, "tool_choice": "auto", "max_tokens": 512, "temperature": 0.7,
+})
+tool_calls = tool_resp["choices"][0]["message"].get("tool_calls") or []
+tool_ok = any(c["function"]["name"] == "get_weather" for c in tool_calls)
+# A wrong --tool-call-parser fails silently and identically to no parser at all:
+# HTTP 200, no tool_calls, and content stripped to empty because the parser
+# consumed the opening tag it could not then parse. Record enough to tell the
+# difference between "model declined" and "parser ate it".
+tool_error = None if tool_ok else "no get_weather call; content=%r finish=%s" % (
+    (tool_resp["choices"][0]["message"].get("content") or "")[:200],
+    tool_resp["choices"][0].get("finish_reason"))
+
+# Mid-conversation system message — one of the two documented chat-template
+# breakages for OpenAI-compatible clients. Pi sends these.
+try:
+    midsys, _ = post(direct, {
+        "model": "qwen38",
+        "messages": [
+            {"role": "user", "content": "Hello."},
+            {"role": "assistant", "content": "Hi there."},
+            {"role": "system", "content": "Answer only in lowercase from now on."},
+            {"role": "user", "content": "Name three colours."},
+        ],
+        "max_tokens": 512, "temperature": 0.7,
+    })
+    midsys_ok = bool(midsys["choices"][0]["message"].get("content"))
+    midsys_error = None
+except urllib.error.HTTPError as e:
+    midsys_ok, midsys_error = False, e.read().decode()[:500]
+
+# Highest reasoning effort. NOT "high": this server accepts only
+# xhigh (its default), medium, and low, and 400s on anything else.
+REASONING_EFFORT_MAX = "xhigh"
+try:
+    hi, _ = post(direct, {
+        "model": "qwen38",
+        "messages": [{"role": "user", "content": "What is 17 * 23?"}],
+        "max_tokens": 512, "temperature": 1.0, "top_p": 0.95,
+        "chat_template_kwargs": {"reasoning_effort": REASONING_EFFORT_MAX},
+    })
+    effort_ok = bool(hi["choices"][0]["message"].get("content"))
+    effort_error = None
+except urllib.error.HTTPError as e:
+    effort_ok, effort_error = False, e.read().decode()[:500]
+
+# Vision — this checkpoint is multimodal and the path is otherwise untested.
+def tiny_png():
+    def chunk(tag, data):
+        c = tag + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + bytes([255, 0, 0]) * 8 for _ in range(8))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
+
+try:
+    vision, _ = post(direct, {
+        "model": "qwen38",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "What colour is this image? One word."},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(tiny_png()).decode()}},
+        ]}],
+        "max_tokens": 512, "temperature": 0.7,
+    })
+    vision_text = vision["choices"][0]["message"].get("content") or ""
+    vision_finish = vision["choices"][0].get("finish_reason")
+    vision_ok = bool(vision_text)
+    vision_error = None if vision_ok else (
+        "truncated before any content: reasoning consumed the whole max_tokens budget"
+        if vision_finish == "length" else "empty content, finish_reason=%s" % vision_finish)
+except urllib.error.HTTPError as e:
+    vision_ok, vision_text, vision_error = False, "", e.read().decode()[:500]
+
+# Routed through LiteLLM, the path the harness actually uses.
+try:
+    routed, _ = post(router, {
+        "model": "qwen38",
+        "messages": [{"role": "user", "content": "Reply with exactly: routed ok"}],
+        "max_tokens": 512, "temperature": 0.7,
+    })
+    routed_ok, routed_error = bool(routed["choices"][0]["message"].get("content")), None
+except urllib.error.HTTPError as e:
+    routed_ok, routed_error = False, e.read().decode()[:500]
+
+best = max(r["decode_tokens_per_second"] for r in results.values())
+code_tok_s = results["code"]["decode_tokens_per_second"]
+
+checks = {
+    "decode_floor": best >= min_tok_s,
+    "thinking": thinking_ok,
+    "tool_call": tool_ok,
+    "reasoning_effort_max": effort_ok,
+    "vision": vision_ok,
+    "litellm_routed": routed_ok,
+    "runtime_memory_floor": min(mem_floor) >= 20.0,
+}
+passed = all(checks.values())
+
+document = {
+    "schema_version": 2,
+    "status": "accepted_on_dgx_spark" if passed else "failed_acceptance",
+    "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "runtime": {
+        "engine": "sglang",
+        "image": "lmsysorg/sglang:qwen38-27b",
+        "model_id": info["model_path"],
+        "model_revision": info["revision"],
+        "draft_model_id": info["speculative_draft_model_path"],
+        "draft_model_revision": info["speculative_draft_model_revision"],
+        "speculative_algorithm": info["speculative_algorithm"],
+        "dspark_block_size": info["speculative_dspark_block_size"],
+        "attention_backend": info["attention_backend"],
+        "mem_fraction_static": info["mem_fraction_static"],
+        "context_length": info["context_length"],
+        "max_total_num_tokens": info["max_total_num_tokens"],
+        "enable_torch_compile": info["enable_torch_compile"],
+        "torch_compile_max_bs": info["torch_compile_max_bs"],
+        "num_continuous_decode_steps": info["num_continuous_decode_steps"],
+    },
+    "performance": results,
+    "observations": {
+        "min_mem_available_gib": round(min(mem_floor), 2),
+        "vision_response": vision_text[:200],
+        "tool_calls": tool_calls,
+    },
+    "errors": {
+        k: v for k, v in {
+            "tool_call": tool_error,
+            "reasoning_effort_max": effort_error,
+            "vision": vision_error,
+            "litellm_routed": routed_error,
+        }.items() if v
+    },
+    "checks": checks,
+    # Probed, recorded, and deliberately not a gate. chat_template.jinja raises
+    # 'System message must be at the beginning.' -- a restriction of the
+    # checkpoint template, not of this stack, and unfixable without forking it.
+    # Pi was measured through a logging proxy over a full multi-turn tool-using
+    # session and emits `system` only at index 0, so it does not block the
+    # harness. Tracked so a template revision that changes it is noticed.
+    "known_limitations": {
+        "mid_conversation_system_message": {
+            "supported": midsys_ok,
+            "source": "chat_template.jinja raise_exception",
+            "harness_impact": "none observed: Pi sends system only at index 0",
+            "server_message": midsys_error,
+        }
+    },
+    "thresholds": {"min_decode_tokens_per_second": min_tok_s, "runtime_memory_floor_gib": 20.0},
+}
+
+pathlib.Path(report_path).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+print(f"\nreport: {report_path}")
+print(f"best decode: {best:.1f} tok/s (code: {code_tok_s:.1f})")
+print(f"min MemAvailable: {min(mem_floor):.2f} GiB")
+for name, ok in checks.items():
+    print(f"  {'PASS' if ok else 'FAIL'}  {name}")
+
+if not passed:
+    raise SystemExit("run-qwen38-canary: acceptance FAILED")
+print("run-qwen38-canary: acceptance passed")
+PY

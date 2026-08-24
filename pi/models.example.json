@@ -1,0 +1,64 @@
+{
+  "providers": {
+    "litellm": {
+      "name": "DGX Spark (LiteLLM router over SSH tunnel)",
+      "baseUrl": "http://127.0.0.1:8180/v1",
+      "api": "openai-completions",
+      "apiKey": "local-litellm",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "maxTokensField": "max_tokens"
+      },
+      "models": [
+        {
+          "id": "qwen38",
+          "name": "Qwen3.8-27B NVFP4 + DSpark (SGLang, spark:8171)",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 262144,
+          "maxTokens": 16384,
+          "samplingParams": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20
+          },
+          "thinkingLevelMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "xhigh",
+            "xhigh": "xhigh",
+            "max": "xhigh"
+          },
+          "compat": {
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false,
+            "maxTokensField": "max_tokens",
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+              "enable_thinking": { "$var": "thinking.enabled" },
+              "reasoning_effort": { "$var": "thinking.effort", "omitWhenOff": true }
+            }
+          }
+        },
+        {
+          "id": "fast_local",
+          "name": "Laguna-S-2.1 NVFP4 + DFlash (vLLM, spark:8170)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 8192
+        },
+        {
+          "id": "private_local",
+          "name": "Laguna-S-2.1 (local only, no cloud fallback)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 32768,
+          "maxTokens": 8192
+        }
+      ]
+    }
+  }
+}

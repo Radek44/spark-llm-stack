@@ -1,0 +1,96 @@
+{
+  "study": "long_context_profile",
+  "date": "2026-08-17",
+  "service": "sglang-qwen38-nvfp4.service",
+  "context_length": 262144,
+  "purpose": "the 262144 promotion gate proved retrieval works at depth but left decode throughput and DSpark acceptance at depth unmeasured; every 28-48 tok/s figure we had came from 2-5k prompts",
+  "method": {
+    "generation": "400 tokens per point, above SGLang's decode_log_interval=40 so decode telemetry actually emits; earlier probes generated 13 tokens and produced no telemetry at all",
+    "separation": "streamed TTFT splits prefill from decode, rather than dividing total wall clock and blending the two",
+    "filler": "varied generated records, not repeated blocks, which the radix cache would collapse into an unrepresentative prefix hit",
+    "task": "identical prose task at every depth, so the depth comparison is like-for-like; prose has the lowest DSpark acceptance of the content types, so these are conservative decode numbers"
+  },
+  "depth_curve": [
+    {
+      "prompt_tokens": 2061,
+      "ttft_s": 0.91,
+      "prefill_tok_s": 2256.1,
+      "decode_tok_s": 21.9
+    },
+    {
+      "prompt_tokens": 29592,
+      "ttft_s": 18.76,
+      "prefill_tok_s": 1577.8,
+      "decode_tok_s": 22.6
+    },
+    {
+      "prompt_tokens": 98461,
+      "ttft_s": 90.46,
+      "prefill_tok_s": 1088.4,
+      "decode_tok_s": 19.2
+    },
+    {
+      "prompt_tokens": 222909,
+      "ttft_s": 313.43,
+      "prefill_tok_s": 711.2,
+      "decode_tok_s": 16.4
+    }
+  ],
+  "dspark_accept_len_by_depth": {
+    "~2k": {
+      "n": 7,
+      "mean": 3.12,
+      "min": 1.85,
+      "max": 4.72
+    },
+    "~30k": {
+      "n": 4,
+      "mean": 2.51,
+      "min": 1.98,
+      "max": 3.23
+    },
+    "~100k": {
+      "n": 4,
+      "mean": 2.64,
+      "min": 2.02,
+      "max": 3.42
+    },
+    "~230k": {
+      "n": 4,
+      "mean": 2.61,
+      "min": 1.93,
+      "max": 3.38
+    },
+    "conclusion": "flat with depth. Speculative decoding does not collapse at long context, so the decode slowdown is attention cost, not draft-model failure."
+  },
+  "radix_prefix_reuse": {
+    "method": "one ~98k body sent three times: cold, then identical prefix with a different trailing question, then the same length with a single token altered at record 2 (~0.1% into the body)",
+    "results": [
+      {
+        "case": "cold",
+        "prompt_tokens": 98429,
+        "ttft_s": 90.61
+      },
+      {
+        "case": "same_prefix_new_tail",
+        "prompt_tokens": 98429,
+        "ttft_s": 0.53,
+        "speedup_vs_cold": 171.0,
+        "seconds_saved": 90.1
+      },
+      {
+        "case": "perturbed_head",
+        "prompt_tokens": 98430,
+        "ttft_s": 90.68,
+        "speedup_vs_cold": 1.0,
+        "seconds_saved": -0.1
+      }
+    ],
+    "conclusion": "reuse is near-total but strictly prefix-anchored. An identical prefix turns 98k tokens of prefill into 0.53s. Changing one token near the top forfeits all of it, even though 99.9% of the content is unchanged."
+  },
+  "operational_consequences": {
+    "long_context_is_cheap_to_hold_expensive_to_establish": "decode falls only 25% (21.9 -> 16.4 tok/s) across a 100x context increase, while prefill throughput falls 68% and TTFT goes superlinear. At 230k, 93% of wall clock is prefill (313s of 338s).",
+    "design_rule": "do not minimize prompt size; minimize prefix churn. Pay for the context once and never invalidate it.",
+    "anti_patterns": "anything that mutates the head of the prompt per attempt costs a full prefill every time: embedded timestamps, attempt or retry counters, elapsed-time banners, reordered tool lists, a rotating system preamble. At 230k that is ~5 minutes per attempt, paid repeatedly overnight."
+  }
+}

@@ -1,0 +1,57 @@
+[Unit]
+Description=SGLang Qwen3.8-27B NVFP4 with DSpark on 8171
+After=network-online.target
+Wants=network-online.target
+# No Requires=docker.service: this is a user unit and docker.service is a
+# system unit, so the reference does not resolve and the unit refuses to
+# start. The launcher validates docker and GPU passthrough itself, exit 78.
+
+[Service]
+Type=simple
+Environment="HF_HOME=%h/models/huggingface"
+Environment="HOST_HF_HOME=%h/models/huggingface"
+Environment="CONTAINER_HF_HOME=/models/huggingface"
+Environment="SGLANG_IMAGE=lmsysorg/sglang:qwen38-27b"
+Environment="CONTAINER_NAME=qwen38-sglang"
+Environment="MODEL_ID=RadixArk/Qwen3.8-27B-NVFP4"
+Environment="MODEL_REVISION=52d1adc5f38aa5ebf099c29ed7025ba34cfbb854"
+Environment="DRAFT_MODEL_ID=RadixArk/Qwen3.8-27B-DSpark"
+Environment="DRAFT_MODEL_REVISION=923ed3a8572615643f0137e424e4ce4edd7f1cda"
+Environment="MODEL_PORT=8171"
+Environment="SERVED_MODEL=qwen38"
+Environment="CONTEXT_LENGTH=262144"
+Environment="MEM_FRACTION_STATIC=0.50"
+Environment="ATTENTION_BACKEND=flashinfer"
+Environment="DSPARK_BLOCK_SIZE=7"
+Environment="TORCH_COMPILE_MAX_BS=4"
+Environment="CONTINUOUS_DECODE_STEPS=2"
+Environment="CONTAINER_MEMORY=100g"
+Environment="QWEN38_SPECULATIVE=true"
+
+# Context runs at the model's full native 262,144. It was promoted from 65,536
+# through the measured gate this comment used to describe as pending.
+#
+# It stays there rather than being trimmed back to free memory: across 10,946
+# usage records from the overnight lane runs the median request is 35,862
+# tokens, p95 110,338, p99 127,959, and the largest ever 172,002. Halving the
+# window to 131,072 would truncate the tail of real work.
+#
+# mem-fraction-static stays at 0.50: higher values fall back to eager mode
+# silently and cost roughly 25% throughput, and lower values run out of KV
+# pool. SGLang refuses to start when max_total_num_tokens drops under
+# context-length, so an over-aggressive value fails loudly at boot rather than
+# quietly under load. Measured here at 0.40 with the cheaper DSpark drafter,
+# the margin was 1.9% (267,213 against 262,144) -- and DFLASH needs more than
+# DSpark, because it runs a second draft KV pool the target must also cover.
+ExecStart=%h/src/spark-llm-stack/scripts/run-sglang-qwen38
+ExecStopPost=-/usr/bin/docker rm -f qwen38-sglang
+
+Restart=no
+# A cold start pays a one-time torch.compile and CUDA graph capture cost of
+# roughly nine minutes. Do not shorten this below that.
+TimeoutStartSec=30min
+TimeoutStopSec=120
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target

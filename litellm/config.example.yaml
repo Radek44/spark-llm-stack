@@ -15,11 +15,38 @@ model_list:
       api_base: http://127.0.0.1:8170/v1
       api_key: local-dummy-key
 
+  # Qwen3.8-27B NVFP4 + DFlash 2 through SGLang. Mutually exclusive with
+  # fast_local/private_local: only one heavyweight checkpoint runs at a time,
+  # so exactly one of :8170 and :8171 answers. Select with `llm-switch qwen38`.
+  #
+  # reasoning_effort defaults to `xhigh` in the checkpoint's chat template, and
+  # xhigh is not a capability level -- it is a system prompt. It injects
+  # "think carefully through the task, validate key assumptions, consider
+  # plausible alternatives..." ahead of whatever the caller actually said.
+  # Verified by rendering the template: that sentence is prepended verbatim.
+  # `medium` injects nothing at all, which is why it is the default here.
+  #
+  # It is also a failure mode, not just a style. On 2026-08-22 two authoring
+  # tasks (T38, T39) ran 43 and 58 minutes and finished at stopReason=length
+  # having written zero bytes -- the thinking phase consumed the entire token
+  # budget before any tool call. Upstream reports the same shape: 32,768 tokens
+  # spent thinking, no content emitted.
+  #
+  # A caller that genuinely wants deeper reasoning still overrides this
+  # per-request; a default is not a ceiling.
+  - model_name: qwen38
+    litellm_params:
+      model: openai/qwen38
+      api_base: http://127.0.0.1:8171/v1
+      api_key: local-dummy-key
+      chat_template_kwargs:
+        reasoning_effort: medium
+
   # Future optional local-only routes. Add services only after benchmarking.
   # - model_name: nemotron_local
   #   litellm_params:
   #     model: openai/nemotron_local
-  #     api_base: http://127.0.0.1:8171/v1
+  #     api_base: http://127.0.0.1:8173/v1
   #     api_key: local-dummy-key
   #
   # - model_name: coder_local
