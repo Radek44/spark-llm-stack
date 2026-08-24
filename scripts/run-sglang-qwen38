@@ -16,7 +16,11 @@ DGX_GPU_RUN="${DGX_GPU_RUN:-$HOME/ai-agent-os/bin/dgx-gpu-run}"
 # (forward-compatible with the GB10's sm_121).
 #
 # NEXTN is not a fallback here: this NVFP4 checkpoint carries no
-# num_nextn_predict_layers, so it has no MTP heads to drive.
+# num_nextn_predict_layers, so it has no MTP heads to drive. (The 15 `mtp.*`
+# tensors ARE in the checkpoint, kept out of quantization by
+# quantization_config.ignore, but without the config key SGLang has nothing to
+# bind them to. Not worth chasing: DFlash 2 beats native MTP on every task in
+# the z-lab table below, so the head would be the slower option even if wired.)
 SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:qwen38-27b}"
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-sglang}"
 # These names are wire formats, not model generations. `qwen3_coder` is the XML
@@ -39,20 +43,93 @@ REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 
 MODEL_ID="${MODEL_ID:-RadixArk/Qwen3.8-27B-NVFP4}"
 MODEL_REVISION="${MODEL_REVISION:-52d1adc5f38aa5ebf099c29ed7025ba34cfbb854}"
-DRAFT_MODEL_ID="${DRAFT_MODEL_ID:-RadixArk/Qwen3.8-27B-DSpark}"
-DRAFT_MODEL_REVISION="${DRAFT_MODEL_REVISION:-923ed3a8572615643f0137e424e4ce4edd7f1cda}"
+# DFlash 2 replaced DSpark on 2026-08-23. It is a block-diffusion drafter:
+# one forward pass proposes a whole block, a selector traces the best coherent
+# path through the candidates. z-lab benchmarked it against THIS EXACT DSpark
+# drafter, on SGLang, and it wins every task. Concurrency 1, which is how the
+# lane runs:
+#
+#   task        DSpark   DFlash2          acceptance length
+#   HumanEval   159.9    214.6 tok/s      3.30 -> 4.39
+#   MBPP        163.3    226.9 tok/s      3.51 -> 4.79
+#   GSM8K       185.3    236.1 tok/s      4.36 -> 5.46
+#
+# Those absolutes are an H200 with FlashAttention 3, not this GB10 on
+# flashinfer, so they do not transfer -- but acceptance length is a property of
+# the drafter's prediction quality, not the GPU, and that is where the gain
+# comes from. Local measurement is in docs/ (spec-bench), not inherited.
+#
+# Lossless, which is the reason this is a safe swap: greedy output matches the
+# target model token for token, so nothing about answer quality is being traded
+# for the speed. The bench asserts that rather than trusting it -- it hashes
+# every completion and compares the hashes across drafters.
+DRAFT_MODEL_ID="${DRAFT_MODEL_ID:-incoai/Qwen3.8-27B-DFlash2}"
+DRAFT_MODEL_REVISION="${DRAFT_MODEL_REVISION:-dedf8df68adfb1afeaf7b7480c0a0243108177b4}"
+SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-DFLASH}"
+# 8 = block size, i.e. 7 draft tokens per verification step. The z-lab numbers
+# above were measured at exactly this setting.
+SPECULATIVE_NUM_DRAFT_TOKENS="${SPECULATIVE_NUM_DRAFT_TOKENS:-8}"
 
 MODEL_PORT="${MODEL_PORT:-8171}"
 SERVED_MODEL="${SERVED_MODEL:-qwen38}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 CONTEXT_LENGTH_SAFE_MAX=262144
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.50}"
+# 0.50 -> 0.40 on 2026-08-23, to hand ~12 GiB back to the rest of the box.
+#
+# At 0.50 the server allocated a KV pool of max_total_num_tokens=426711 against
+# a 262144-token window -- 1.63x the largest request it can ever be asked to
+# serve. That ratio buys concurrency, and this host serves ONE agent lane at a
+# time, so it was buying nothing. Measured over 10,946 usage records from the
+# overnight lane runs: median request 35,862 tokens, p95 110,338, p99 127,959,
+# largest ever 172,002.
+#
+# CONTEXT_LENGTH stays at the full 262144 for that same reason. Halving the
+# window to 131072 was the obvious way to free more, and the p99 above is why
+# it would have been wrong -- it truncates the tail of real work, and T60 in
+# particular.
+#
+# The floor is hard: SGLang refuses to start if max_total_num_tokens drops
+# below CONTEXT_LENGTH. That makes an over-aggressive value a loud failure at
+# boot rather than a silent one under load, so this is tuned by reading the
+# startup line, not by guessing:
+#   max_total_num_tokens=... context_len=...
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.40}"
 MEM_FRACTION_STATIC_SAFE_MAX=0.50
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-7}"
 TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-4}"
 CONTINUOUS_DECODE_STEPS="${CONTINUOUS_DECODE_STEPS:-2}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flashinfer}"
+# sglang renamed this flag: --mamba-scheduler-strategy became
+# --mamba-radix-cache-strategy. The old name still works on the newer image
+# but warns; the NEW name does not exist on the older image and is a hard
+# arg-parse failure there. Both images are kept on disk as each other's
+# revert path, so the name has to travel with the image rather than be
+# hardcoded. Default is the old name, which is what the base unit (still
+# pinned to the older image) needs.
+MAMBA_STRATEGY_FLAG="${MAMBA_STRATEGY_FLAG:---mamba-scheduler-strategy}"
 CONTAINER_MEMORY="${CONTAINER_MEMORY:-100g}"
+
+# The checkpoint's own chat_template.jinja has three failure modes that an
+# agentic harness walks straight into, so it is overridden with Unsloth's
+# corrected template for the same model. Diffed, not assumed -- all three are
+# raise_exception paths or silent drops, none are cosmetic:
+#
+#   1. `developer` role is unhandled. Pi and Codex-style harnesses send it.
+#      The stock template has no branch, so it falls through to the
+#      "System message must be at the beginning" raise.
+#   2. Only messages[0] is read as system. A second leading system message --
+#      which is what --append-system-prompt produces -- is dropped on the
+#      floor. Unsloth merges the run of leading system/developer messages.
+#   3. `raise_exception('No user query found in messages.')` fires whenever
+#      multi_step_tool is set, which is a hard throw mid-loop. Removed.
+#
+# Plus the tool-calling fix: `tool_call.arguments is mapping` instead of
+# `is defined and != ''`, which is what makes nested-object arguments parse.
+#
+# Verified rendering locally with a system+developer+user message list before
+# wiring it in; it merges to "S1\nD1" and emits a well-formed prompt.
+CHAT_TEMPLATE_HOST="${CHAT_TEMPLATE_HOST:-$HOME/src/spark-llm-stack/config/qwen38-chat-template-unsloth.jinja}"
+CHAT_TEMPLATE_CONTAINER=/config/qwen38-chat-template.jinja
 
 HOST_HF_HOME="${HOST_HF_HOME:-$HOME/models/huggingface}"
 CONTAINER_HF_HOME="${CONTAINER_HF_HOME:-/models/huggingface}"
@@ -61,6 +138,13 @@ SGLANG_ENTRY="${SGLANG_ENTRY:-python3 -m sglang.launch_server}"
 [[ -x "$DGX_GPU_RUN" ]] || { echo "missing DGX GPU launcher: $DGX_GPU_RUN" >&2; exit 78; }
 command -v docker >/dev/null 2>&1 || { echo "docker is required for the SGLang service" >&2; exit 78; }
 [[ -d "$HOST_HF_HOME" ]] || { echo "missing Hugging Face home: $HOST_HF_HOME" >&2; exit 78; }
+# Silently falling back to the checkpoint's own template would reintroduce all
+# three throw paths above, and would do it invisibly.
+[[ -f "$CHAT_TEMPLATE_HOST" ]] || {
+  echo "missing chat template: $CHAT_TEMPLATE_HOST" >&2
+  echo "fetch: curl -sL https://huggingface.co/unsloth/Qwen3.8-27B/raw/main/chat_template.jinja -o \"$CHAT_TEMPLATE_HOST\"" >&2
+  exit 78
+}
 
 # Without GPU passthrough the container starts and then fails to see the GPU,
 # which reads as a model bug rather than a host misconfiguration.
@@ -129,6 +213,7 @@ docker_args=(
   --ipc host
   --memory "$CONTAINER_MEMORY"
   -v "$HOST_HF_HOME:$CONTAINER_HF_HOME"
+  -v "$CHAT_TEMPLATE_HOST:$CHAT_TEMPLATE_CONTAINER:ro"
   -e "HF_HOME=$CONTAINER_HF_HOME"
   "$SGLANG_IMAGE"
 )
@@ -143,23 +228,39 @@ server_args=(
   --context-length "$CONTEXT_LENGTH"
   --mem-fraction-static "$MEM_FRACTION_STATIC"
   --attention-backend "$ATTENTION_BACKEND"
-  --mamba-scheduler-strategy extra_buffer
+  "$MAMBA_STRATEGY_FLAG" extra_buffer
   --num-continuous-decode-steps "$CONTINUOUS_DECODE_STEPS"
   --enable-torch-compile
   --torch-compile-max-bs "$TORCH_COMPILE_MAX_BS"
   --trust-remote-code
   --tool-call-parser "$TOOL_CALL_PARSER"
   --reasoning-parser "$REASONING_PARSER"
+  --chat-template "$CHAT_TEMPLATE_CONTAINER"
 )
 
 if [[ "${QWEN38_SPECULATIVE:-true}" = "true" ]]; then
   server_args+=(
-    --speculative-algorithm DSPARK
+    --speculative-algorithm "$SPECULATIVE_ALGORITHM"
     --speculative-draft-model-path "$DRAFT_MODEL_ID"
     --speculative-draft-model-revision "$DRAFT_MODEL_REVISION"
-    --speculative-dspark-block-size "$DSPARK_BLOCK_SIZE"
-    --speculative-draft-model-quantization unquant
   )
+  case "$SPECULATIVE_ALGORITHM" in
+    DFLASH)
+      server_args+=(--speculative-num-draft-tokens "$SPECULATIVE_NUM_DRAFT_TOKENS")
+      ;;
+    DSPARK)
+      # Kept reachable as SPECULATIVE_ALGORITHM=DSPARK so the previous
+      # configuration can be restored in one variable if DFlash 2 regresses.
+      server_args+=(
+        --speculative-dspark-block-size "$DSPARK_BLOCK_SIZE"
+        --speculative-draft-model-quantization unquant
+      )
+      ;;
+    *)
+      echo "unsupported SPECULATIVE_ALGORITHM: $SPECULATIVE_ALGORITHM" >&2
+      exit 78
+      ;;
+  esac
 fi
 
 exec "$DGX_GPU_RUN" --label qwen38-27b --profile llm \

@@ -28,10 +28,21 @@ Environment="CONTINUOUS_DECODE_STEPS=2"
 Environment="CONTAINER_MEMORY=100g"
 Environment="QWEN38_SPECULATIVE=true"
 
-# Context starts at 65,536 rather than the model's native 262,144. The larger
-# window reportedly fits, but promoting it is a separate measured gate — the
-# same rule Laguna follows. mem-fraction-static stays at 0.50: higher values
-# fall back to eager mode silently and cost roughly 25% throughput.
+# Context runs at the model's full native 262,144. It was promoted from 65,536
+# through the measured gate this comment used to describe as pending.
+#
+# It stays there rather than being trimmed back to free memory: across 10,946
+# usage records from the overnight lane runs the median request is 35,862
+# tokens, p95 110,338, p99 127,959, and the largest ever 172,002. Halving the
+# window to 131,072 would truncate the tail of real work.
+#
+# mem-fraction-static stays at 0.50: higher values fall back to eager mode
+# silently and cost roughly 25% throughput, and lower values run out of KV
+# pool. SGLang refuses to start when max_total_num_tokens drops under
+# context-length, so an over-aggressive value fails loudly at boot rather than
+# quietly under load. Measured here at 0.40 with the cheaper DSpark drafter,
+# the margin was 1.9% (267,213 against 262,144) -- and DFLASH needs more than
+# DSpark, because it runs a second draft KV pool the target must also cover.
 ExecStart=%h/src/spark-llm-stack/scripts/run-sglang-qwen38
 ExecStopPost=-/usr/bin/docker rm -f qwen38-sglang
 

@@ -1,0 +1,42 @@
+{
+  "label": "dspark",
+  "aggregate_tok_per_s": 34.0,
+  "results": [
+    {
+      "elapsed_s": 34.1,
+      "completion_tokens": 1200,
+      "tok_per_s": 35.2,
+      "prompt_tokens": 40,
+      "content_sha": "e0be5d7a3e982272",
+      "reasoning_sha": "c95ffad94c36688b",
+      "content_chars": 52,
+      "reasoning_chars": 3974,
+      "finish_reason": "length",
+      "prompt_index": 1
+    },
+    {
+      "elapsed_s": 31.37,
+      "completion_tokens": 1200,
+      "tok_per_s": 38.3,
+      "prompt_tokens": 59,
+      "content_sha": "d212a637234b2b18",
+      "reasoning_sha": "3caa067f32a92780",
+      "content_chars": 620,
+      "reasoning_chars": 2498,
+      "finish_reason": "length",
+      "prompt_index": 2
+    },
+    {
+      "elapsed_s": 38.82,
+      "completion_tokens": 1142,
+      "tok_per_s": 29.4,
+      "prompt_tokens": 48,
+      "content_sha": "012faf1837cd8fba",
+      "reasoning_sha": "1df4580842d9355a",
+      "content_chars": 554,
+      "reasoning_chars": 3700,
+      "finish_reason": "stop",
+      "prompt_index": 3
+    }
+  ]
+}
