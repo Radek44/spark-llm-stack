@@ -214,6 +214,77 @@ is silent. It also exercises tool calls, thinking mode, vision, LiteLLM routing,
 known chat-template breakages for OpenAI-compatible clients (mid-conversation system messages
 and `reasoning_effort: high`) — both of which the Pi harness triggers.
 
+### GPU broker residency adapter (default off)
+
+The Qwen launcher now uses the registry's canonical exclusive lease identity,
+`sglang-qwen38` / `llm`. Broker residency remains opt-in: with no private environment file,
+the registry stays `off`, `dgx-gpu-run` keeps its historical direct-lock path, the lifecycle
+unit skips, and Qwen remains a manual service.
+
+When `QWEN38_BROKER_RESIDENCY=true` is reviewed and deployed, the launcher raises only this
+run to broker `shadow` mode. The direct flock remains authoritative, but shadow mode also
+hardens that same canonical lock to the owner-only `0600` mode required by broker proof. A
+separate oneshot runs after the Qwen start job: it requires systemd `ActiveState=active`, a
+stable `MainPID` boot/PID/start/UID identity, HTTP 200 from the registry health endpoint, and
+then a successful exact `qwen-sglang` broker registration proof. It never starts, stops, or
+restarts a GPU service.
+
+Generation state lives at
+`~/.local/state/spark-llm-stack/qwen-sglang-residency-v1.json`, owner-only and atomically
+fsynced. The adapter allocates above both its local high-watermark and the broker's durable
+latest generation. A lost response is recovered by adopting the broker row only when its
+generation equals the exact local pending/registered high-watermark and its current registry
+fingerprint, holder, systemd service, service-cgroup CUDA count, lease metadata, lock inode,
+holder-owned WRITE FLOCK, and state all re-prove exactly. A broker generation below the local
+high-watermark is never adopted. An uncommitted pending operation may retry its same generation
+idempotently; operators must not edit, choose, or reuse generations by hand.
+
+On shutdown, Docker cleanup runs first. The adapter releases only after `MainPID=0`, the
+recorded process identity is gone (including PID-reuse detection), the global CUDA compute PID
+set is empty, and `/proc/locks` has no WRITE FLOCK for the recorded canonical device/inode.
+Failure or ambiguity leaves the broker residency active and the unit failed for operator
+reconciliation. `ExecStopPost` runs inside the Qwen stop transaction, so managed conflicting
+services cannot consume the interval before that proof and exact release.
+
+Deploying the files does not opt in:
+
+```bash
+cp qwen-sglang-broker-lifecycle.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+# Do not create the environment file or enable the lifecycle unit yet.
+```
+
+After the broker's documented Linux host spike has passed in a separately authorized canary,
+the reviewed opt-in is:
+
+The spike must specifically prove that the Qwen unit's `MainPID` (`dgx-gpu-run`) owns the
+canonical WRITE FLOCK and that the broker's systemd inspector sees exactly one Qwen CUDA PID in
+that unit's cgroup. Rootful Docker can place the GPU process outside a user-unit cgroup; if that
+shape produces `resident-process-count-mismatch`, keep the adapter off until the inspector or
+cgroup contract is changed and reviewed.
+
+```bash
+install -d -m 0700 ~/.config/spark-llm-stack
+printf '%s\n' 'QWEN38_BROKER_RESIDENCY=true' \
+  > ~/.config/spark-llm-stack/qwen-sglang-broker.env
+chmod 0600 ~/.config/spark-llm-stack/qwen-sglang-broker.env
+systemctl --user enable qwen-sglang-broker-lifecycle.service
+systemctl --user daemon-reload
+```
+
+Enabling the lifecycle unit does not enable Qwen; it only reconciles a stale durable row after
+a user-manager or host restart. Inspect with
+`scripts/qwen-sglang-broker-lifecycle status` and `agentos gpu residencies`. To roll back,
+first stop Qwen and confirm the exact generation is `released`, then remove the environment
+file and disable the lifecycle unit.
+
+This adapter is intentionally limited to `off` → per-run `shadow`. Global `enforced` mode has
+no resident-bootstrap contract: `dgx-gpu-run` would require a live resident generation before
+the service that creates it can start. The pre-start hook therefore fails closed under
+`enforced`; do not promote until the broker owner defines that transition. Broker grants also
+do not recheck HTTP health, so live-but-unready residency withdrawal remains a broker contract
+follow-up rather than an adapter workaround.
+
 ### Pi harness (runs on the Mac, not here)
 
 Pi is a BYOK CLI coding agent driving this stack over an SSH tunnel. The router binds
@@ -288,7 +359,7 @@ The router uses a 1,200-second local inference timeout and does not silently dro
 ```bash
 mkdir -p ~/.config/systemd/user
 cp vllm-laguna-s21-nvfp4.service sglang-qwen38-nvfp4.service litellm.service \
-  flux-klein.service comfyui.service \
+  qwen-sglang-broker-lifecycle.service flux-klein.service comfyui.service \
   ~/.config/systemd/user/
 
 for d in drop-ins/*/; do

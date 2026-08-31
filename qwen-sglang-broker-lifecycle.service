@@ -1,0 +1,16 @@
+[Unit]
+Description=Reconcile the exact Qwen/SGLang GPU broker residency
+After=sglang-qwen38-nvfp4.service agentos-gpu-broker.service
+
+[Service]
+Type=oneshot
+UMask=0077
+Environment="QWEN38_BROKER_RESIDENCY=false"
+EnvironmentFile=-%h/.config/spark-llm-stack/qwen-sglang-broker.env
+ExecCondition=/usr/bin/python3 -B %h/src/spark-llm-stack/scripts/qwen-sglang-broker-lifecycle enabled
+ExecStart=/usr/bin/python3 -B %h/src/spark-llm-stack/scripts/qwen-sglang-broker-lifecycle recover
+TimeoutStartSec=31min
+Restart=no
+
+[Install]
+WantedBy=default.target

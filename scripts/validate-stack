@@ -10,9 +10,10 @@ fail() {
   exit 1
 }
 
-for script in "$repo_root"/harden-llm-stack.sh "$repo_root"/llm-switch "$repo_root"/scripts/run-vllm-laguna "$repo_root"/scripts/run-comfyui-canary; do
+for script in "$repo_root"/harden-llm-stack.sh "$repo_root"/llm-switch "$repo_root"/scripts/run-vllm-laguna "$repo_root"/scripts/run-sglang-qwen38 "$repo_root"/scripts/run-comfyui-canary; do
   bash -n "$script"
 done
+PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/check-qwen-sglang-broker-lifecycle.py"
 python3 -m json.tool "$registry" >/dev/null
 python3 - "$registry" <<'PY'
 import json, sys
@@ -25,6 +26,19 @@ for name, profile in document["profiles"].items():
     if profile.get("exclusive_gpu"):
         assert name in startup, f"{name} lacks a startup threshold"
         assert name in runtime, f"{name} lacks a runtime floor"
+broker = document["gpu_broker"]
+assert broker["rollout"]["mode"] == "off"
+qwen = broker["residencies"]["qwen-sglang"]
+expected_qwen = {
+    "service": "sglang_qwen38",
+    "unit": "sglang-qwen38-nvfp4.service",
+    "lease": {"label": "sglang-qwen38", "profile": "llm", "mode": "exclusive"},
+    "compute_process_count": 1,
+}
+assert all(qwen.get(key) == value for key, value in expected_qwen.items())
+assert set(qwen) in (set(expected_qwen), set(expected_qwen) | {"kind"})
+if "kind" in qwen:
+    assert qwen["kind"] == "exclusive"
 PY
 "$HOME/ai-agent-os/shared/scripts/check-dgx-gpu-run.sh"
 "$repo_root/scripts/check-vllm-laguna-env"
@@ -37,16 +51,31 @@ for required in 'dgx-gpu-run' '--extra-model-paths-config' '--reserve-vram 32' '
   grep -Fq -- "$required" "$comfy_unit" || fail "ComfyUI is missing $required"
 done
 
-for unit in vllm-laguna-s21-nvfp4.service flux-klein.service comfyui.service; do
-  if ! grep -Fq 'dgx-gpu-run' "$repo_root/$unit" && ! grep -Fq 'run-vllm-laguna' "$repo_root/$unit"; then
+for unit in vllm-laguna-s21-nvfp4.service sglang-qwen38-nvfp4.service flux-klein.service comfyui.service; do
+  if ! grep -Fq 'dgx-gpu-run' "$repo_root/$unit" \
+    && ! grep -Fq 'run-vllm-laguna' "$repo_root/$unit" \
+    && ! grep -Fq 'run-sglang-qwen38' "$repo_root/$unit"; then
     fail "$unit does not hold the machine-wide GPU lease"
   fi
   grep -Fq 'Restart=no' "$repo_root/$unit" || fail "$unit may automatically restart"
-  if [[ "$unit" != vllm-laguna-s21-nvfp4.service ]]; then
+  if [[ "$unit" != vllm-laguna-s21-nvfp4.service && "$unit" != sglang-qwen38-nvfp4.service ]]; then
     grep -Fq -- '--timeout 30' "$repo_root/$unit" || fail "$unit may wait indefinitely for the GPU lease"
   fi
 done
 grep -Fq -- '--timeout "${DGX_LOCK_TIMEOUT:-30}"' "$repo_root/scripts/run-vllm-laguna" || fail 'Laguna may wait indefinitely for the GPU lease'
+grep -Fq -- '--timeout "${DGX_LOCK_TIMEOUT:-30}"' "$repo_root/scripts/run-sglang-qwen38" || fail 'Qwen may wait indefinitely for the GPU lease'
+grep -Fq -- '--label sglang-qwen38' "$repo_root/scripts/run-sglang-qwen38" || fail 'Qwen lease label does not match the broker registry'
+grep -Fq -- '--workload qwen-sglang' "$repo_root/scripts/run-sglang-qwen38" || fail 'Qwen launcher lacks its broker workload identity'
+grep -Fq -- '--client-id sglang' "$repo_root/scripts/run-sglang-qwen38" || fail 'Qwen launcher lacks its broker client identity'
+grep -Fq -- 'QWEN38_BROKER_RESIDENCY:-false' "$repo_root/scripts/run-sglang-qwen38" || fail 'Qwen broker residency is not default-off'
+grep -Fq -- '--broker-mode shadow' "$repo_root/scripts/run-sglang-qwen38" || fail 'Qwen residency opt-in does not harden the direct lock through shadow mode'
+grep -Fq 'Wants=qwen-sglang-broker-lifecycle.service' "$repo_root/sglang-qwen38-nvfp4.service" || fail 'Qwen unit does not schedule post-readiness reconciliation'
+grep -Fq 'qwen-sglang-broker-lifecycle pre-start' "$repo_root/sglang-qwen38-nvfp4.service" || fail 'Qwen unit does not reconcile stale residency before launch'
+grep -Fq 'qwen-sglang-broker-lifecycle hook-stop' "$repo_root/sglang-qwen38-nvfp4.service" || fail 'Qwen unit lacks proof-driven residency release'
+grep -Fq 'After=sglang-qwen38-nvfp4.service' "$repo_root/qwen-sglang-broker-lifecycle.service" || fail 'Qwen lifecycle companion may run before systemd readiness'
+if grep -Eq '^(PartOf|BindsTo)=' "$repo_root/qwen-sglang-broker-lifecycle.service"; then
+  fail 'Qwen lifecycle companion may be stopped before release proof'
+fi
 grep -Fq -- 'LAGUNA_SPECULATIVE:-false' "$repo_root/scripts/run-vllm-laguna" || fail 'Laguna direct-launch default is not target-only'
 grep -Fq -- 'LAGUNA_ENFORCE_EAGER:-true' "$repo_root/scripts/run-vllm-laguna" || fail 'Laguna direct-launch default is not eager'
 grep -Fq 'MODEL_REVISION=07614121b31898586430f189d27a25a0be310843' "$repo_root/vllm-laguna-s21-nvfp4.service" || fail 'Laguna service is not pinned to the Spark-safe target'

@@ -23,6 +23,7 @@ DGX_GPU_RUN="${DGX_GPU_RUN:-$HOME/ai-agent-os/bin/dgx-gpu-run}"
 # the z-lab table below, so the head would be the slower option even if wired.)
 SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:qwen38-27b}"
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-sglang}"
+QWEN38_BROKER_RESIDENCY="${QWEN38_BROKER_RESIDENCY:-false}"
 # These names are wire formats, not model generations. `qwen3_coder` is the XML
 # tool syntax (<tool_call><function=name><parameter=x>) that Qwen3.8's own
 # chat_template.jinja emits, and `qwen3` is its <think> reasoning format -- both
@@ -136,6 +137,10 @@ CONTAINER_HF_HOME="${CONTAINER_HF_HOME:-/models/huggingface}"
 SGLANG_ENTRY="${SGLANG_ENTRY:-python3 -m sglang.launch_server}"
 
 [[ -x "$DGX_GPU_RUN" ]] || { echo "missing DGX GPU launcher: $DGX_GPU_RUN" >&2; exit 78; }
+case "$QWEN38_BROKER_RESIDENCY" in
+  true|false) ;;
+  *) echo "QWEN38_BROKER_RESIDENCY must be exactly true or false" >&2; exit 78 ;;
+esac
 command -v docker >/dev/null 2>&1 || { echo "docker is required for the SGLang service" >&2; exit 78; }
 [[ -d "$HOST_HF_HOME" ]] || { echo "missing Hugging Face home: $HOST_HF_HOME" >&2; exit 78; }
 # Silently falling back to the checkpoint's own template would reintroduce all
@@ -263,6 +268,14 @@ if [[ "${QWEN38_SPECULATIVE:-true}" = "true" ]]; then
   esac
 fi
 
-exec "$DGX_GPU_RUN" --label qwen38-27b --profile llm \
-  --timeout "${DGX_LOCK_TIMEOUT:-30}" -- \
+broker_args=(--workload qwen-sglang --client-id sglang)
+if [[ "$QWEN38_BROKER_RESIDENCY" = "true" ]]; then
+  # Residency registration requires the broker's owner-only lock proof. Shadow
+  # mode preserves the direct flock as authority while hardening that same file
+  # to 0600 and recording the reviewed qwen-sglang workload identity.
+  broker_args+=(--broker-mode shadow)
+fi
+
+exec "$DGX_GPU_RUN" --label sglang-qwen38 --profile llm \
+  --timeout "${DGX_LOCK_TIMEOUT:-30}" "${broker_args[@]}" -- \
   docker "${docker_args[@]}" $SGLANG_ENTRY "${server_args[@]}"

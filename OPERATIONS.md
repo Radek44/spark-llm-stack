@@ -25,7 +25,8 @@ journalctl --since '24h ago' -k | grep -iE 'oom|killed process|out of memory' ||
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp vllm-laguna-s21-nvfp4.service litellm.service flux-klein.service comfyui.service \
+cp vllm-laguna-s21-nvfp4.service sglang-qwen38-nvfp4.service \
+  qwen-sglang-broker-lifecycle.service litellm.service flux-klein.service comfyui.service \
   ~/.config/systemd/user/
 for d in drop-ins/*/; do
   svc=$(basename "$d")
@@ -82,6 +83,34 @@ llm-switch boot-router
 This enables only `litellm.service` at boot. Model/media services (`fast_local`, `imagine`, `comfyui`) stay disabled and are started explicitly with `llm-switch` after memory checks. `llm-switch boot-default <heavy-slot>` refuses heavyweight boot defaults unless `--force-heavy` is provided.
 
 Avoid socket-activating vLLM directly on port 8170: a health probe or accidental request could load the full checkpoint and reproduce the previous memory-pressure failure mode.
+
+## Qwen broker residency (not yet activated)
+
+The tracked Qwen adapter is default-off. Merely copying its unit does not register a
+residency, enable Qwen, or change the registry's `off` policy. Before any opt-in:
+
+1. Run `scripts/check-qwen-sglang-broker-lifecycle.py` and `scripts/validate-stack`.
+2. Complete the Linux cgroup, `MainPID`, CUDA, `/proc/locks`, and broker kill-point spike
+   required by `~/ai-agent-os/docs/DGX-GPU-BROKER.md` from an isolated clean worktree.
+   In particular, prove that `dgx-gpu-run` is the unit `MainPID` and exact flock holder, and
+   that the rootful Docker CUDA PID is visible inside the user unit's cgroup. A
+   `resident-process-count-mismatch` is a stop condition, not an exception to waive.
+3. Confirm `agentos gpu residencies` has no contradictory active row and Qwen remains disabled.
+4. Create the owner-only environment file and enable only
+   `qwen-sglang-broker-lifecycle.service` as documented in `README.md`. This recovery oneshot
+   does not enable or start Qwen.
+
+The lifecycle state file is durable recovery evidence, not a second GPU exclusion authority.
+The canonical flock remains the sole exclusion lock, and generations must never be hand-edited
+or reused. Registration requires systemd plus HTTP readiness and the broker's exact service,
+holder, CUDA-count, lease, and flock proof. Release waits for `MainPID=0`, exact holder death,
+an empty global CUDA set, and disappearance of the recorded WRITE FLOCK; any missing proof
+fails closed. Run `scripts/qwen-sglang-broker-lifecycle status` and
+`agentos gpu residencies` to reconcile failures.
+
+Do not set the global broker policy to `enforced` for Qwen. Resident bootstrap is circular in
+v1 and remains an explicit contract blocker; this adapter supports only the reviewed per-run
+shadow transition.
 
 ## Unified-memory safety
 

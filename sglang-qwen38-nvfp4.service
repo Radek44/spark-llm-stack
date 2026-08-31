@@ -2,6 +2,7 @@
 Description=SGLang Qwen3.8-27B NVFP4 with DSpark on 8171
 After=network-online.target
 Wants=network-online.target
+Wants=qwen-sglang-broker-lifecycle.service
 # No Requires=docker.service: this is a user unit and docker.service is a
 # system unit, so the reference does not resolve and the unit refuses to
 # start. The launcher validates docker and GPU passthrough itself, exit 78.
@@ -27,6 +28,10 @@ Environment="TORCH_COMPILE_MAX_BS=4"
 Environment="CONTINUOUS_DECODE_STEPS=2"
 Environment="CONTAINER_MEMORY=100g"
 Environment="QWEN38_SPECULATIVE=true"
+# Broker residency is a reviewed opt-in. The absent environment file leaves
+# both the runner and lifecycle companion on their historical default-off path.
+Environment="QWEN38_BROKER_RESIDENCY=false"
+EnvironmentFile=-%h/.config/spark-llm-stack/qwen-sglang-broker.env
 
 # Context runs at the model's full native 262,144. It was promoted from 65,536
 # through the measured gate this comment used to describe as pending.
@@ -43,8 +48,10 @@ Environment="QWEN38_SPECULATIVE=true"
 # quietly under load. Measured here at 0.40 with the cheaper DSpark drafter,
 # the margin was 1.9% (267,213 against 262,144) -- and DFLASH needs more than
 # DSpark, because it runs a second draft KV pool the target must also cover.
+ExecStartPre=/usr/bin/python3 -B %h/src/spark-llm-stack/scripts/qwen-sglang-broker-lifecycle pre-start
 ExecStart=%h/src/spark-llm-stack/scripts/run-sglang-qwen38
 ExecStopPost=-/usr/bin/docker rm -f qwen38-sglang
+ExecStopPost=/usr/bin/python3 -B %h/src/spark-llm-stack/scripts/qwen-sglang-broker-lifecycle hook-stop
 
 Restart=no
 # A cold start pays a one-time torch.compile and CUDA graph capture cost of
