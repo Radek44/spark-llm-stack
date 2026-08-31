@@ -1,0 +1,1039 @@
+#!/usr/bin/env python3
+"""Proof-driven lifecycle adapter for the Qwen/SGLang broker residency."""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping
+
+
+sys.dont_write_bytecode = True
+
+SCHEMA_VERSION = 1
+RESIDENT_ID = "qwen-sglang"
+SERVICE_KEY = "sglang_qwen38"
+UNIT = "sglang-qwen38-nvfp4.service"
+LEASE_LABEL = "sglang-qwen38"
+LEASE_PROFILE = "llm"
+LEASE_MODE = "exclusive"
+COMPUTE_PROCESS_COUNT = 1
+MAX_LEASE_METADATA_BYTES = 65536
+DEFAULT_STATE_DIR = Path.home() / ".local/state/spark-llm-stack"
+DEFAULT_REGISTRY = Path.home() / "ai-agent-os/config/dgx-runtime-registry.json"
+DEFAULT_AGENTOS_GPU = Path.home() / "ai-agent-os/bin/agentos-gpu"
+
+
+class LifecycleError(RuntimeError):
+    """A proof was unavailable or contradicted the lifecycle contract."""
+
+
+class ProcessAbsent(LifecycleError):
+    """The kernel proved that a specific PID no longer exists."""
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    boot_id: str
+    pid: int
+    start_identity: str
+    uid: int
+
+
+@dataclass(frozen=True)
+class ServiceSnapshot:
+    active_state: str
+    main_pid: int
+    control_group: str
+
+
+@dataclass
+class StateTransaction:
+    store: "StateStore"
+    document: dict[str, Any]
+
+    def write(self) -> None:
+        self.store._write(self.document)
+
+
+class StateStore:
+    """Owner-only, fsync-backed generation high-watermark and recovery evidence."""
+
+    def __init__(self, directory: Path = DEFAULT_STATE_DIR):
+        self.directory = directory
+        self.path = directory / "qwen-sglang-residency-v1.json"
+        self.lock_path = directory / "qwen-sglang-residency-v1.lock"
+
+    @staticmethod
+    def _empty() -> dict[str, Any]:
+        return {"schema_version": SCHEMA_VERSION, "high_watermark": 0, "residency": None}
+
+    def _ensure_directory(self) -> None:
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            info = self.directory.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.getuid()
+            ):
+                raise LifecycleError(f"unsafe lifecycle state directory: {self.directory}")
+            os.chmod(self.directory, 0o700)
+        except OSError as exc:
+            raise LifecycleError(f"cannot secure lifecycle state directory: {exc}") from exc
+
+    def _open_lock(self) -> int:
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(self.lock_path, flags, 0o600)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise LifecycleError(f"unsafe lifecycle state lock: {self.lock_path}")
+            os.fchmod(descriptor, 0o600)
+            return descriptor
+        except BaseException:
+            if "descriptor" in locals():
+                os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _validate_identity(entry: Mapping[str, Any]) -> None:
+        required = {
+            "holder_boot_id": str,
+            "holder_pid": int,
+            "holder_start_identity": str,
+            "holder_uid": int,
+        }
+        for key, expected_type in required.items():
+            value = entry.get(key)
+            valid_type = (
+                type(value) is int
+                if expected_type is int
+                else isinstance(value, expected_type)
+            )
+            if not valid_type or (expected_type is str and not value):
+                raise LifecycleError(f"invalid lifecycle state identity field: {key}")
+        if int(entry["holder_pid"]) <= 0 or int(entry["holder_uid"]) < 0:
+            raise LifecycleError("invalid lifecycle state process identity")
+
+    @classmethod
+    def _validate(cls, document: object) -> dict[str, Any]:
+        if not isinstance(document, dict) or set(document) != {
+            "schema_version",
+            "high_watermark",
+            "residency",
+        }:
+            raise LifecycleError("invalid lifecycle state document")
+        if (
+            type(document.get("schema_version")) is not int
+            or document.get("schema_version") != SCHEMA_VERSION
+        ):
+            raise LifecycleError("unsupported lifecycle state schema")
+        high_watermark = document.get("high_watermark")
+        if type(high_watermark) is not int or high_watermark < 0:
+            raise LifecycleError("invalid lifecycle generation high-watermark")
+        entry = document.get("residency")
+        if entry is not None:
+            if not isinstance(entry, dict):
+                raise LifecycleError("invalid lifecycle residency evidence")
+            generation = entry.get("generation")
+            phase = entry.get("state")
+            if type(generation) is not int or generation <= 0:
+                raise LifecycleError("invalid lifecycle residency generation")
+            if generation > high_watermark:
+                raise LifecycleError("lifecycle generation exceeds high-watermark")
+            if phase not in {"pending", "registered", "released"}:
+                raise LifecycleError("invalid lifecycle residency state")
+            cls._validate_identity(entry)
+            for key in ("lock_device", "lock_inode"):
+                value = entry.get(key)
+                if value is not None and (type(value) is not int or value <= 0):
+                    raise LifecycleError(f"invalid lifecycle state field: {key}")
+            if phase == "registered" and any(
+                type(entry.get(key)) is not int or int(entry[key]) <= 0
+                for key in ("lock_device", "lock_inode")
+            ):
+                raise LifecycleError("registered lifecycle state lacks lock evidence")
+        return document
+
+    def _load(self) -> dict[str, Any]:
+        if not self.path.exists() and not self.path.is_symlink():
+            return self._empty()
+        try:
+            info = self.path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise LifecycleError(f"unsafe lifecycle state file: {self.path}")
+            return self._validate(json.loads(self.path.read_text(encoding="utf-8")))
+        except LifecycleError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LifecycleError(f"cannot read lifecycle state: {exc}") from exc
+
+    def _write(self, document: dict[str, Any]) -> None:
+        self._validate(document)
+        payload = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        temporary: str | None = None
+        descriptor: int | None = None
+        try:
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=".qwen-sglang-residency-", dir=self.directory
+            )
+            os.fchmod(descriptor, 0o600)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            os.replace(temporary, self.path)
+            temporary = None
+            directory_fd = os.open(
+                self.directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            raise LifecycleError(f"cannot durably write lifecycle state: {exc}") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    @contextmanager
+    def transaction(self) -> Iterator[StateTransaction]:
+        self._ensure_directory()
+        descriptor = self._open_lock()
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield StateTransaction(self, self._load())
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def read(self) -> dict[str, Any]:
+        with self.transaction() as transaction:
+            return json.loads(json.dumps(transaction.document))
+
+    def has_unreleased(self) -> bool:
+        if not self.path.exists() and not self.path.is_symlink():
+            return False
+        entry = self.read().get("residency")
+        return isinstance(entry, dict) and entry.get("state") in {"pending", "registered"}
+
+
+class HostProbe:
+    """Fixed-argv production probes and the broker's narrow operator API."""
+
+    def __init__(
+        self,
+        registry_path: Path = DEFAULT_REGISTRY,
+        agentos_gpu: Path = DEFAULT_AGENTOS_GPU,
+    ):
+        self.registry_path = registry_path
+        self.agentos_gpu = agentos_gpu
+        self.lock_path: Path
+        self.health_url: str
+        self.rollout_mode: str
+        self._load_contract()
+
+    def _load_contract(self) -> None:
+        try:
+            registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+            broker = registry["gpu_broker"]
+            policy = broker["residencies"][RESIDENT_ID]
+            lease = policy["lease"]
+            service = registry["services"][SERVICE_KEY]
+            lock_path = registry["resources"]["host_gpu_lock"]
+            rollout_mode = broker["rollout"]["mode"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise LifecycleError(f"cannot load the DGX broker contract: {exc}") from exc
+        expected = {
+            "service": SERVICE_KEY,
+            "unit": UNIT,
+            "compute_process_count": COMPUTE_PROCESS_COUNT,
+        }
+        if any(policy.get(key) != value for key, value in expected.items()):
+            raise LifecycleError("Qwen residency registry contract drifted")
+        if type(policy.get("compute_process_count")) is not int:
+            raise LifecycleError("Qwen residency process-count contract is invalid")
+        if lease != {"label": LEASE_LABEL, "profile": LEASE_PROFILE, "mode": LEASE_MODE}:
+            raise LifecycleError("Qwen residency lease contract drifted")
+        if service.get("unit") != UNIT or service.get("manual") is not True:
+            raise LifecycleError("Qwen service registry contract drifted")
+        endpoint = service.get("endpoint")
+        health_path = service.get("health_path")
+        try:
+            parsed_endpoint = urllib.parse.urlsplit(endpoint)
+            endpoint_port = parsed_endpoint.port
+        except (TypeError, ValueError):
+            parsed_endpoint = None
+            endpoint_port = None
+        if (
+            parsed_endpoint is None
+            or parsed_endpoint.scheme != "http"
+            or parsed_endpoint.hostname != "127.0.0.1"
+            or endpoint_port is None
+            or parsed_endpoint.username is not None
+            or parsed_endpoint.password is not None
+            or parsed_endpoint.query
+            or parsed_endpoint.fragment
+        ):
+            raise LifecycleError("Qwen health endpoint is not host-local HTTP")
+        if not isinstance(health_path, str) or not health_path.startswith("/"):
+            raise LifecycleError("Qwen health path is invalid")
+        if not isinstance(lock_path, str) or not Path(lock_path).is_absolute():
+            raise LifecycleError("canonical DGX lock path is invalid")
+        if rollout_mode not in {"off", "shadow", "enforced"}:
+            raise LifecycleError("unsupported DGX broker rollout mode")
+        self.lock_path = Path(lock_path)
+        self.health_url = endpoint.rstrip("/") + health_path
+        self.rollout_mode = rollout_mode
+        self.registry_fingerprint = hashlib.sha256(
+            json.dumps(registry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _run(argv: list[str], timeout: float = 10) -> str:
+        try:
+            result = subprocess.run(
+                argv,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            return result.stdout
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail = getattr(exc, "stderr", None) or str(exc)
+            raise LifecycleError(f"command failed: {argv[0]}: {str(detail).strip()}") from exc
+
+    def assert_bootstrap_supported(self) -> None:
+        if self.rollout_mode == "enforced":
+            raise LifecycleError(
+                "Qwen resident bootstrap is circular under enforced broker mode; "
+                "keep rollout off/shadow until the broker contract defines bootstrap"
+            )
+
+    def assert_registry_current(self) -> None:
+        try:
+            registry = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LifecycleError("current DGX broker registry is unavailable") from exc
+        fingerprint = hashlib.sha256(
+            json.dumps(registry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if fingerprint != self.registry_fingerprint:
+            raise LifecycleError("DGX broker registry changed during lifecycle proof")
+
+    def service_snapshot(self) -> ServiceSnapshot:
+        output = self._run(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "show",
+                UNIT,
+                "--property=ActiveState",
+                "--property=MainPID",
+                "--property=ControlGroup",
+                "--no-pager",
+            ],
+            timeout=5,
+        )
+        values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+        try:
+            return ServiceSnapshot(
+                values["ActiveState"], int(values["MainPID"]), values["ControlGroup"]
+            )
+        except (KeyError, ValueError) as exc:
+            raise LifecycleError("systemd did not return a complete Qwen identity") from exc
+
+    def process_identity(self, pid: int) -> ProcessIdentity:
+        try:
+            boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="ascii"
+            ).strip()
+        except OSError as exc:
+            raise LifecycleError("kernel boot identity is unavailable") from exc
+        if not boot_id:
+            raise LifecycleError("kernel boot identity is empty")
+
+        stat_path = Path(f"/proc/{pid}/stat")
+        status_path = Path(f"/proc/{pid}/status")
+
+        def read_process_file(path: Path) -> str:
+            try:
+                return path.read_text(encoding="ascii")
+            except OSError as exc:
+                if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                    raise ProcessAbsent(f"PID {pid} no longer exists") from exc
+                raise LifecycleError(f"process identity unavailable for PID {pid}") from exc
+
+        def start_from_stat(stat_line: str) -> str:
+            end_comm = stat_line.rfind(")")
+            if end_comm < 2:
+                raise ValueError("malformed proc stat")
+            fields = stat_line[end_comm + 2 :].split()
+            return fields[19]
+
+        try:
+            start_identity = start_from_stat(read_process_file(stat_path))
+            status = read_process_file(status_path).splitlines()
+            uid_line = next(line for line in status if line.startswith("Uid:"))
+            uid = int(uid_line.split()[1])
+            confirmed_start = start_from_stat(read_process_file(stat_path))
+            if confirmed_start != start_identity:
+                raise LifecycleError(f"process identity changed while reading PID {pid}")
+            return ProcessIdentity(boot_id, pid, start_identity, uid)
+        except ProcessAbsent:
+            raise
+        except LifecycleError:
+            raise
+        except (ValueError, IndexError, StopIteration) as exc:
+            raise LifecycleError(f"process identity unavailable for PID {pid}") from exc
+
+    def health_ready(self) -> bool:
+        request = urllib.request.Request(self.health_url, method="GET")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=2) as response:
+                return response.status == 200
+        except (OSError, urllib.error.URLError):
+            return False
+
+    def _agentos(self, *arguments: str) -> Any:
+        output = self._run(
+            [str(self.agentos_gpu), "--registry", str(self.registry_path), *arguments]
+        )
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise LifecycleError("agentos GPU command returned invalid JSON") from exc
+
+    def broker_residencies(self) -> list[dict[str, Any]]:
+        value = self._agentos("residencies")
+        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+            raise LifecycleError("broker returned invalid residency state")
+        return value
+
+    def register_residency(self, generation: int) -> dict[str, Any]:
+        value = self._agentos("residency-register", RESIDENT_ID, str(generation))
+        if not isinstance(value, dict):
+            raise LifecycleError("broker returned invalid registration proof")
+        return value
+
+    def release_residency(self, generation: int) -> dict[str, Any]:
+        value = self._agentos("residency-release", RESIDENT_ID, str(generation))
+        if not isinstance(value, dict):
+            raise LifecycleError("broker returned invalid release proof")
+        return value
+
+    def cuda_pids(self) -> tuple[int, ...]:
+        output = self._run(
+            [
+                "/usr/bin/nvidia-smi",
+                "--query-compute-apps=pid",
+                "--format=csv,noheader,nounits",
+            ],
+            timeout=5,
+        )
+        pids: set[int] = set()
+        for line in output.splitlines():
+            value = line.strip()
+            if not value:
+                continue
+            if not value.isdigit():
+                raise LifecycleError("nvidia-smi returned an unrecognized compute PID")
+            pids.add(int(value))
+        return tuple(sorted(pids))
+
+    @staticmethod
+    def _parse_lock_holder(
+        lines: list[str], *, device: int, inode: int
+    ) -> int | None:
+        holder: int | None = None
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 6 or fields[1] != "FLOCK" or fields[3] != "WRITE":
+                continue
+            try:
+                major, minor, candidate_inode = fields[5].split(":", 2)
+                candidate_device = os.makedev(int(major, 16), int(minor, 16))
+                candidate_inode_value = int(candidate_inode)
+                candidate_holder = int(fields[4])
+            except (TypeError, ValueError) as exc:
+                raise LifecycleError("cannot parse a WRITE FLOCK from /proc/locks") from exc
+            if candidate_device != device or candidate_inode_value != inode:
+                continue
+            if holder is not None and holder != candidate_holder:
+                raise LifecycleError("canonical DGX lock has multiple WRITE holders")
+            holder = candidate_holder
+        return holder
+
+    def prove_active_residency(
+        self, row: Mapping[str, Any], holder: ProcessIdentity
+    ) -> None:
+        """Re-prove the broker's registration invariants before adopting a row."""
+
+        snapshot = self.service_snapshot()
+        if snapshot.active_state != "active" or snapshot.main_pid != holder.pid:
+            raise LifecycleError("active residency service identity changed")
+        if self.process_identity(holder.pid) != holder:
+            raise LifecycleError("active residency holder identity changed")
+
+        if (
+            not snapshot.control_group.startswith("/")
+            or ".." in Path(snapshot.control_group).parts
+        ):
+            raise LifecycleError("active residency cgroup is invalid")
+        cgroup_procs = (
+            Path("/sys/fs/cgroup")
+            / snapshot.control_group.lstrip("/")
+            / "cgroup.procs"
+        )
+        try:
+            service_pids = {
+                int(line)
+                for line in cgroup_procs.read_text(encoding="ascii").splitlines()
+                if line
+            }
+        except (OSError, ValueError) as exc:
+            raise LifecycleError("active residency cgroup proof unavailable") from exc
+        service_cuda_pids = service_pids & set(self.cuda_pids())
+        if len(service_cuda_pids) != COMPUTE_PROCESS_COUNT:
+            raise LifecycleError("active residency CUDA process count changed")
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(self.lock_path, flags)
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_dev != row.get("lock_device")
+                or info.st_ino != row.get("lock_inode")
+            ):
+                raise LifecycleError("active residency lock identity changed")
+            raw = os.read(descriptor, MAX_LEASE_METADATA_BYTES + 1)
+            if len(raw) > MAX_LEASE_METADATA_BYTES:
+                raise LifecycleError("active residency lease metadata is too large")
+            metadata = json.loads(raw.decode("utf-8"))
+        except LifecycleError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LifecycleError("active residency lease evidence is unavailable") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if not isinstance(metadata, dict) or any(
+            metadata.get(key) != value
+            for key, value in {
+                "state": "held",
+                "pid": holder.pid,
+                "label": LEASE_LABEL,
+                "profile": LEASE_PROFILE,
+            }.items()
+        ):
+            raise LifecycleError("active residency lease metadata changed")
+        try:
+            lines = Path("/proc/locks").read_text(encoding="ascii").splitlines()
+        except OSError as exc:
+            raise LifecycleError("active residency lock proof unavailable") from exc
+        lock_holder = self._parse_lock_holder(
+            lines, device=int(row["lock_device"]), inode=int(row["lock_inode"])
+        )
+        if lock_holder != holder.pid:
+            raise LifecycleError("active residency lock is not held by the service")
+
+        confirmation = self.service_snapshot()
+        if confirmation.active_state != "active" or confirmation.main_pid != holder.pid:
+            raise LifecycleError("active residency changed across adoption proof")
+        if self.process_identity(holder.pid) != holder:
+            raise LifecycleError("active residency holder changed across adoption proof")
+
+    def outer_lock_absent(self, device: int, inode: int) -> bool:
+        try:
+            info = self.lock_path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_dev != device
+                or info.st_ino != inode
+            ):
+                raise LifecycleError("canonical DGX lock identity changed")
+            lines = Path("/proc/locks").read_text(encoding="ascii").splitlines()
+        except LifecycleError:
+            raise
+        except OSError as exc:
+            raise LifecycleError(f"outer-lock proof unavailable: {exc}") from exc
+        return self._parse_lock_holder(lines, device=device, inode=inode) is None
+
+
+class Lifecycle:
+    def __init__(
+        self,
+        store: StateStore,
+        host: Any,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        poll_seconds: float = 1.0,
+    ):
+        if poll_seconds <= 0:
+            raise LifecycleError("poll interval must be positive")
+        self.store = store
+        self.host = host
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self.poll_seconds = poll_seconds
+
+    @staticmethod
+    def _identity_from_row(row: Mapping[str, Any]) -> ProcessIdentity:
+        try:
+            boot_id = row["holder_boot_id"]
+            pid = row["holder_pid"]
+            start_identity = row["holder_start_identity"]
+            uid = row["holder_uid"]
+        except KeyError as exc:
+            raise LifecycleError("broker residency lacks a holder identity") from exc
+        if (
+            not isinstance(boot_id, str)
+            or not boot_id
+            or type(pid) is not int
+            or pid <= 0
+            or not isinstance(start_identity, str)
+            or not start_identity
+            or type(uid) is not int
+            or uid < 0
+        ):
+            raise LifecycleError("broker residency has an invalid holder identity")
+        identity = ProcessIdentity(boot_id, pid, start_identity, uid)
+        if not identity.boot_id or not identity.start_identity or identity.pid <= 0:
+            raise LifecycleError("broker residency has an invalid holder identity")
+        return identity
+
+    @staticmethod
+    def _same_identity(left: ProcessIdentity, right: ProcessIdentity) -> bool:
+        return left == right
+
+    @staticmethod
+    def _entry_identity(entry: Mapping[str, Any]) -> ProcessIdentity:
+        return ProcessIdentity(
+            str(entry["holder_boot_id"]),
+            int(entry["holder_pid"]),
+            str(entry["holder_start_identity"]),
+            int(entry["holder_uid"]),
+        )
+
+    @staticmethod
+    def _residency_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        matches = [row for row in rows if row.get("resident_id") == RESIDENT_ID]
+        if len(matches) > 1:
+            raise LifecycleError("broker returned duplicate Qwen residencies")
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _valid_fingerprint(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    def _validate_row(
+        self,
+        row: Mapping[str, Any],
+        *,
+        generation: int | None = None,
+        state: str | None = None,
+        holder: ProcessIdentity | None = None,
+        allow_registry_drift: bool = False,
+    ) -> None:
+        exact = {
+            "resident_id": RESIDENT_ID,
+            "service_key": SERVICE_KEY,
+            "service_unit": UNIT,
+            "lease_label": LEASE_LABEL,
+            "lease_profile": LEASE_PROFILE,
+            "lease_mode": LEASE_MODE,
+            "compute_process_count": COMPUTE_PROCESS_COUNT,
+        }
+        if any(row.get(key) != value for key, value in exact.items()):
+            raise LifecycleError("broker residency proof does not match the Qwen contract")
+        if type(row.get("compute_process_count")) is not int:
+            raise LifecycleError("broker residency proof has an invalid process count")
+        row_generation = row.get("generation")
+        if type(row_generation) is not int or row_generation <= 0:
+            raise LifecycleError("broker residency proof has an invalid generation")
+        if generation is not None and row_generation != generation:
+            raise LifecycleError("broker residency proof returned the wrong generation")
+        if state is not None and row.get("state") != state:
+            raise LifecycleError("broker residency proof returned the wrong state")
+        row_holder = self._identity_from_row(row)
+        if holder is not None and row_holder != holder:
+            raise LifecycleError("broker residency proof returned the wrong holder")
+        for key in ("lock_device", "lock_inode"):
+            value = row.get(key)
+            if type(value) is not int or value <= 0:
+                raise LifecycleError(f"broker residency proof has invalid {key}")
+        fingerprint = row.get("registry_fingerprint")
+        if not self._valid_fingerprint(fingerprint):
+            raise LifecycleError("broker residency proof has an invalid registry fingerprint")
+        current_fingerprint = getattr(self.host, "registry_fingerprint", None)
+        if not self._valid_fingerprint(current_fingerprint):
+            raise LifecycleError("current registry fingerprint is unavailable")
+        if not allow_registry_drift and fingerprint != current_fingerprint:
+            raise LifecycleError("broker residency proof has a stale registry fingerprint")
+
+    @staticmethod
+    def _state_entry(
+        generation: int,
+        state: str,
+        holder: ProcessIdentity,
+        row: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "generation": generation,
+            "state": state,
+            "holder_boot_id": holder.boot_id,
+            "holder_pid": holder.pid,
+            "holder_start_identity": holder.start_identity,
+            "holder_uid": holder.uid,
+            "lock_device": None if row is None else row.get("lock_device"),
+            "lock_inode": None if row is None else row.get("lock_inode"),
+        }
+
+    def _wait_ready(self, timeout: float) -> ProcessIdentity:
+        if timeout <= 0:
+            raise LifecycleError("readiness timeout must be positive")
+        deadline = self.monotonic() + timeout
+        last = "systemd has not exposed a live MainPID"
+        while True:
+            snapshot = self.host.service_snapshot()
+            if snapshot.main_pid > 0:
+                try:
+                    holder = self.host.process_identity(snapshot.main_pid)
+                    if snapshot.active_state == "active" and self.host.health_ready():
+                        confirmation = self.host.service_snapshot()
+                        if confirmation.active_state == "active" and confirmation.main_pid == holder.pid:
+                            confirmed_holder = self.host.process_identity(holder.pid)
+                            if self._same_identity(holder, confirmed_holder):
+                                return holder
+                        last = "service identity changed across readiness proof"
+                    else:
+                        last = f"systemd={snapshot.active_state}, http_ready=false"
+                except LifecycleError as exc:
+                    last = str(exc)
+            else:
+                last = f"systemd={snapshot.active_state}, MainPID={snapshot.main_pid}"
+            if self.monotonic() >= deadline:
+                raise LifecycleError(f"Qwen readiness proof timed out: {last}")
+            self.sleep(min(self.poll_seconds, max(0.0, deadline - self.monotonic())))
+
+    def register(self, *, readiness_timeout: float = 1800.0) -> int:
+        holder = self._wait_ready(readiness_timeout)
+        with self.store.transaction() as transaction:
+            document = transaction.document
+            current = document.get("residency")
+            self.host.assert_registry_current()
+            rows = self.host.broker_residencies()
+            broker_row = self._residency_row(rows)
+            broker_high = 0
+            if broker_row is not None:
+                generation_value = broker_row.get("generation")
+                if type(generation_value) is not int or generation_value <= 0:
+                    raise LifecycleError("broker returned an invalid Qwen generation")
+                broker_high = generation_value
+                broker_state = broker_row.get("state")
+                if broker_state not in {"active", "released"}:
+                    raise LifecycleError("broker returned an invalid Qwen residency state")
+                self._validate_row(
+                    broker_row,
+                    state=str(broker_state),
+                    allow_registry_drift=True,
+                )
+                if broker_row.get("state") == "active":
+                    if (
+                        self._identity_from_row(broker_row) == holder
+                        and broker_row.get("registry_fingerprint")
+                        == self.host.registry_fingerprint
+                        and isinstance(current, dict)
+                        and current.get("state") in {"pending", "registered"}
+                        and current.get("generation") == broker_row.get("generation")
+                        and current.get("generation") == document.get("high_watermark")
+                        and self._entry_identity(current) == holder
+                    ):
+                        self.host.assert_registry_current()
+                        self.host.prove_active_residency(broker_row, holder)
+                        self.host.assert_registry_current()
+                        generation = int(broker_row["generation"])
+                        document["high_watermark"] = max(
+                            int(document["high_watermark"]), generation
+                        )
+                        document["residency"] = self._state_entry(
+                            generation, "registered", holder, broker_row
+                        )
+                        transaction.write()
+                        return generation
+            generation: int
+            if (
+                isinstance(current, dict)
+                and current.get("state") == "pending"
+                and int(current["generation"]) == int(document["high_watermark"])
+                and int(current["generation"]) > broker_high
+                and self._entry_identity(current) == holder
+            ):
+                generation = int(current["generation"])
+            else:
+                generation = max(int(document["high_watermark"]), broker_high) + 1
+                document["high_watermark"] = generation
+                document["residency"] = self._state_entry(
+                    generation, "pending", holder
+                )
+                transaction.write()
+            self.host.assert_registry_current()
+            response = self.host.register_residency(generation)
+            self._validate_row(
+                response, generation=generation, state="active", holder=holder
+            )
+            document["high_watermark"] = max(int(document["high_watermark"]), generation)
+            document["residency"] = self._state_entry(
+                generation, "registered", holder, response
+            )
+            transaction.write()
+            return generation
+
+    def _holder_is_gone(self, holder: ProcessIdentity) -> bool:
+        try:
+            return self.host.process_identity(holder.pid) != holder
+        except ProcessAbsent:
+            return True
+
+    def _absence(self, row: Mapping[str, Any]) -> tuple[bool, tuple[str, ...]]:
+        holder = self._identity_from_row(row)
+        snapshot = self.host.service_snapshot()
+        missing: list[str] = []
+        if snapshot.main_pid != 0 or snapshot.active_state == "active":
+            missing.append("service")
+        if not self._holder_is_gone(holder):
+            missing.append("pid")
+        if self.host.cuda_pids():
+            missing.append("cuda")
+        if not self.host.outer_lock_absent(
+            int(row["lock_device"]), int(row["lock_inode"])
+        ):
+            missing.append("outer-lock")
+        return not missing, tuple(missing)
+
+    def _wait_absent(self, row: Mapping[str, Any], timeout: float) -> None:
+        if timeout <= 0:
+            raise LifecycleError("release timeout must be positive")
+        deadline = self.monotonic() + timeout
+        while True:
+            complete, missing = self._absence(row)
+            if complete:
+                return
+            if self.monotonic() >= deadline:
+                raise LifecycleError(
+                    "Qwen release proof timed out; still present: " + ", ".join(missing)
+                )
+            self.sleep(min(self.poll_seconds, max(0.0, deadline - self.monotonic())))
+
+    def release(self, *, release_timeout: float = 75.0) -> int | None:
+        with self.store.transaction() as transaction:
+            document = transaction.document
+            broker_row = self._residency_row(self.host.broker_residencies())
+            local = document.get("residency")
+            if broker_row is None:
+                if isinstance(local, dict) and local.get("state") != "released":
+                    local["state"] = "released"
+                    transaction.write()
+                    return int(local["generation"])
+                return None if not isinstance(local, dict) else int(local["generation"])
+            generation_value = broker_row.get("generation")
+            if type(generation_value) is not int or generation_value <= 0:
+                raise LifecycleError("broker returned an invalid Qwen generation")
+            generation = generation_value
+            holder = self._identity_from_row(broker_row)
+            document["high_watermark"] = max(int(document["high_watermark"]), generation)
+            if broker_row.get("state") == "released":
+                self._validate_row(
+                    broker_row,
+                    generation=generation,
+                    state="released",
+                    allow_registry_drift=True,
+                )
+                document["residency"] = self._state_entry(
+                    generation, "released", holder, broker_row
+                )
+                transaction.write()
+                return generation
+            self._validate_row(
+                broker_row,
+                generation=generation,
+                state="active",
+                allow_registry_drift=True,
+            )
+            document["residency"] = self._state_entry(
+                generation, "registered", holder, broker_row
+            )
+            transaction.write()
+            self._wait_absent(broker_row, release_timeout)
+            confirmation = self._residency_row(self.host.broker_residencies())
+            if confirmation is None:
+                document["residency"]["state"] = "released"
+                transaction.write()
+                return generation
+            if confirmation.get("state") == "released":
+                self._validate_row(
+                    confirmation,
+                    generation=generation,
+                    state="released",
+                    holder=holder,
+                    allow_registry_drift=True,
+                )
+                document["residency"] = self._state_entry(
+                    generation, "released", holder, confirmation
+                )
+                transaction.write()
+                return generation
+            self._validate_row(
+                confirmation,
+                generation=generation,
+                state="active",
+                holder=holder,
+                allow_registry_drift=True,
+            )
+            complete, missing = self._absence(confirmation)
+            if not complete:
+                raise LifecycleError(
+                    "Qwen release proof changed before commit: " + ", ".join(missing)
+                )
+            response = self.host.release_residency(generation)
+            self._validate_row(
+                response,
+                generation=generation,
+                state="released",
+                holder=holder,
+                allow_registry_drift=True,
+            )
+            document["residency"] = self._state_entry(
+                generation, "released", holder, response
+            )
+            transaction.write()
+            return generation
+
+    def recover(
+        self, *, readiness_timeout: float = 1800.0, release_timeout: float = 75.0
+    ) -> int | None:
+        snapshot = self.host.service_snapshot()
+        if snapshot.main_pid > 0:
+            return self.register(readiness_timeout=readiness_timeout)
+        return self.release(release_timeout=release_timeout)
+
+
+def enabled() -> bool:
+    value = os.getenv("QWEN38_BROKER_RESIDENCY", "false")
+    if value not in {"true", "false"}:
+        raise LifecycleError("QWEN38_BROKER_RESIDENCY must be exactly true or false")
+    return value == "true"
+
+
+def positive_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise LifecycleError(f"{name} must be a positive number") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise LifecycleError(f"{name} must be a positive number")
+    return value
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "action", choices=("enabled", "pre-start", "hook-stop", "recover", "register", "release", "status")
+    )
+    arguments = parser.parse_args()
+    if arguments.action == "enabled":
+        return 0 if enabled() else 1
+
+    store = StateStore(DEFAULT_STATE_DIR)
+    if arguments.action in {"pre-start", "hook-stop"} and not enabled():
+        if not store.has_unreleased():
+            print("qwen-sglang residency: disabled")
+            return 0
+    if arguments.action == "status":
+        print(json.dumps(store.read(), sort_keys=True))
+        return 0
+
+    host = HostProbe(DEFAULT_REGISTRY)
+    lifecycle = Lifecycle(
+        store,
+        host,
+        poll_seconds=positive_float("QWEN38_BROKER_POLL_SECONDS", 1.0),
+    )
+    readiness_timeout = positive_float("QWEN38_BROKER_READINESS_TIMEOUT", 1800.0)
+    # Stay below the unit's 120-second TimeoutStopSec so a failed proof can
+    # exit visibly instead of being killed by systemd at the same boundary.
+    release_timeout = 75.0
+
+    if arguments.action == "pre-start":
+        if enabled():
+            host.assert_bootstrap_supported()
+        generation = lifecycle.release(release_timeout=release_timeout)
+    elif arguments.action == "hook-stop" or arguments.action == "release":
+        generation = lifecycle.release(release_timeout=release_timeout)
+    elif arguments.action == "register":
+        generation = lifecycle.register(readiness_timeout=readiness_timeout)
+    else:
+        generation = lifecycle.recover(
+            readiness_timeout=readiness_timeout, release_timeout=release_timeout
+        )
+    if generation is None:
+        print("qwen-sglang residency: no generation")
+    else:
+        print(f"qwen-sglang residency generation {generation}: {arguments.action} complete")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except LifecycleError as exc:
+        print(f"qwen-sglang residency: {exc}", file=sys.stderr)
+        raise SystemExit(78) from exc
