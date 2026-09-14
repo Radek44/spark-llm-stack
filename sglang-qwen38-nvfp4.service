@@ -1,5 +1,5 @@
 [Unit]
-Description=SGLang Qwen3.8-27B NVFP4 with DSpark on 8171
+Description=SGLang Qwen3.8-27B NVFP4 with DFlash2 on 8171
 After=network-online.target
 Wants=network-online.target
 Wants=qwen-sglang-broker-lifecycle.service
@@ -12,12 +12,12 @@ Type=simple
 Environment="HF_HOME=%h/models/huggingface"
 Environment="HOST_HF_HOME=%h/models/huggingface"
 Environment="CONTAINER_HF_HOME=/models/huggingface"
-Environment="SGLANG_IMAGE=lmsysorg/sglang:qwen38-27b"
+Environment="SGLANG_IMAGE=lmsysorg/sglang@sha256:4cba07b0c68725991890c64843403396effb7faa39ac47261166b2299095c513"
 Environment="CONTAINER_NAME=qwen38-sglang"
 Environment="MODEL_ID=RadixArk/Qwen3.8-27B-NVFP4"
 Environment="MODEL_REVISION=52d1adc5f38aa5ebf099c29ed7025ba34cfbb854"
-Environment="DRAFT_MODEL_ID=RadixArk/Qwen3.8-27B-DSpark"
-Environment="DRAFT_MODEL_REVISION=923ed3a8572615643f0137e424e4ce4edd7f1cda"
+Environment="DRAFT_MODEL_ID=incoai/Qwen3.8-27B-DFlash2"
+Environment="DRAFT_MODEL_REVISION=dedf8df68adfb1afeaf7b7480c0a0243108177b4"
 Environment="MODEL_PORT=8171"
 Environment="SERVED_MODEL=qwen38"
 Environment="CONTEXT_LENGTH=262144"
@@ -27,6 +27,17 @@ Environment="DSPARK_BLOCK_SIZE=7"
 Environment="TORCH_COMPILE_MAX_BS=4"
 Environment="CONTINUOUS_DECODE_STEPS=2"
 Environment="CONTAINER_MEMORY=100g"
+Environment="SPECULATIVE_ALGORITHM=DFLASH"
+Environment="SPECULATIVE_NUM_DRAFT_TOKENS=8"
+Environment="MAMBA_STRATEGY_FLAG=--mamba-radix-cache-strategy"
+Environment="ENABLE_TORCH_COMPILE=false"
+Environment="CHUNKED_PREFILL_SIZE=2048"
+Environment="MAMBA_SSM_DTYPE=bfloat16"
+Environment="MAMBA_STRATEGY=extra_buffer_lazy"
+Environment="MAX_RUNNING_REQUESTS=4"
+Environment="CUDA_GRAPH_MAX_BS=8"
+Environment="DISABLE_FLASHINFER_AUTOTUNE=true"
+Environment="SLEEP_ON_IDLE=true"
 Environment="QWEN38_SPECULATIVE=true"
 # Broker residency is a reviewed opt-in. The absent environment file leaves
 # both the runner and lifecycle companion on their historical default-off path.
@@ -54,8 +65,8 @@ ExecStopPost=-/usr/bin/docker rm -f qwen38-sglang
 ExecStopPost=/usr/bin/python3 -B %h/src/spark-llm-stack/scripts/qwen-sglang-broker-lifecycle hook-stop
 
 Restart=no
-# A cold start pays a one-time torch.compile and CUDA graph capture cost of
-# roughly nine minutes. Do not shorten this below that.
+# A measured fresh-container start takes roughly four minutes. CUDA graphs
+# remain enabled; torch.compile is disabled on the promoted image.
 TimeoutStartSec=30min
 TimeoutStopSec=120
 LimitNOFILE=1048576

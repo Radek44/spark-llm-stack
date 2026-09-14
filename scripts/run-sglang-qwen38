@@ -1,27 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Qwen3.8-27B NVFP4 + DSpark speculative decoding through SGLang.
+# Qwen3.8-27B NVFP4 with optional speculative decoding through SGLang.
 #
-# GB10 has native FP4 tensor cores, so the NVFP4 checkpoint plus the DSpark
-# draft beats both llama.cpp+MTP (~27 tok/s) and vLLM+MTP (~24.5 tok/s) on this
-# host. The generic SGLang cookbook selects the FP8 checkpoint and the fa3
-# attention backend; both are Hopper-tuned and must not be copied here.
+# GB10 has native FP4 tensor cores. Keep the NVFP4 checkpoint and measure any
+# serving comparison on this host before treating an alternative as faster.
+# Use the cookbook operating point for GB10: NVFP4 and FlashInfer.
+# Throughput published for Hopper or larger Blackwell GPUs does not transfer.
 
 DGX_GPU_RUN="${DGX_GPU_RUN:-$HOME/ai-agent-os/bin/dgx-gpu-run}"
-# The qwen38-27b tag, not a numbered release. The stable images through
-# v0.5.10.post1-cu130 only offer EAGLE/EAGLE3/NEXTN/STANDALONE/NGRAM and reject
-# DSPARK outright; this tag ships DFLASH and DSPARK, and lmsys published it
-# alongside the model. Verified linux/arm64, torch 2.13+cu130, sm_120 cubins
-# (forward-compatible with the GB10's sm_121).
-#
-# NEXTN is not a fallback here: this NVFP4 checkpoint carries no
-# num_nextn_predict_layers, so it has no MTP heads to drive. (The 15 `mtp.*`
-# tensors ARE in the checkpoint, kept out of quantization by
-# quantization_config.ignore, but without the config key SGLang has nothing to
-# bind them to. Not worth chasing: DFlash 2 beats native MTP on every task in
-# the z-lab table below, so the head would be the slower option even if wired.)
-SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang:qwen38-27b}"
+# Official v0.5.19-cu130 ARM64 manifest, measured on this GB10 with DFlash2.
+# Pin the image and draft together; earlier stock Qwen images lack DFlash2.
+SGLANG_IMAGE="${SGLANG_IMAGE:-lmsysorg/sglang@sha256:4cba07b0c68725991890c64843403396effb7faa39ac47261166b2299095c513}"
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-sglang}"
 QWEN38_BROKER_RESIDENCY="${QWEN38_BROKER_RESIDENCY:-false}"
 # These names are wire formats, not model generations. `qwen3_coder` is the XML
@@ -44,70 +34,39 @@ REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 
 MODEL_ID="${MODEL_ID:-RadixArk/Qwen3.8-27B-NVFP4}"
 MODEL_REVISION="${MODEL_REVISION:-52d1adc5f38aa5ebf099c29ed7025ba34cfbb854}"
-# DFlash 2 replaced DSpark on 2026-08-23. It is a block-diffusion drafter:
-# one forward pass proposes a whole block, a selector traces the best coherent
-# path through the candidates. z-lab benchmarked it against THIS EXACT DSpark
-# drafter, on SGLang, and it wins every task. Concurrency 1, which is how the
-# lane runs:
-#
-#   task        DSpark   DFlash2          acceptance length
-#   HumanEval   159.9    214.6 tok/s      3.30 -> 4.39
-#   MBPP        163.3    226.9 tok/s      3.51 -> 4.79
-#   GSM8K       185.3    236.1 tok/s      4.36 -> 5.46
-#
-# Those absolutes are an H200 with FlashAttention 3, not this GB10 on
-# flashinfer, so they do not transfer -- but acceptance length is a property of
-# the drafter's prediction quality, not the GPU, and that is where the gain
-# comes from. Local measurement is in docs/ (spec-bench), not inherited.
-#
-# Lossless, which is the reason this is a safe swap: greedy output matches the
-# target model token for token, so nothing about answer quality is being traded
-# for the speed. The bench asserts that rather than trusting it -- it hashes
-# every completion and compares the hashes across drafters.
+# DFlash2 speculates for the unchanged target model. Local serving comparisons
+# and their bounded correctness checks are documented beside this launcher.
+# Matching completion hashes do not prove general quality or equivalence.
 DRAFT_MODEL_ID="${DRAFT_MODEL_ID:-incoai/Qwen3.8-27B-DFlash2}"
 DRAFT_MODEL_REVISION="${DRAFT_MODEL_REVISION:-dedf8df68adfb1afeaf7b7480c0a0243108177b4}"
 SPECULATIVE_ALGORITHM="${SPECULATIVE_ALGORITHM:-DFLASH}"
-# 8 = block size, i.e. 7 draft tokens per verification step. The z-lab numbers
-# above were measured at exactly this setting.
+# Block size 8: seven draft tokens per verification step.
 SPECULATIVE_NUM_DRAFT_TOKENS="${SPECULATIVE_NUM_DRAFT_TOKENS:-8}"
 
 MODEL_PORT="${MODEL_PORT:-8171}"
 SERVED_MODEL="${SERVED_MODEL:-qwen38}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-262144}"
 CONTEXT_LENGTH_SAFE_MAX=262144
-# 0.50 -> 0.40 on 2026-08-23, to hand ~12 GiB back to the rest of the box.
-#
-# At 0.50 the server allocated a KV pool of max_total_num_tokens=426711 against
-# a 262144-token window -- 1.63x the largest request it can ever be asked to
-# serve. That ratio buys concurrency, and this host serves ONE agent lane at a
-# time, so it was buying nothing. Measured over 10,946 usage records from the
-# overnight lane runs: median request 35,862 tokens, p95 110,338, p99 127,959,
-# largest ever 172,002.
-#
-# CONTEXT_LENGTH stays at the full 262144 for that same reason. Halving the
-# window to 131072 was the obvious way to free more, and the p99 above is why
-# it would have been wrong -- it truncates the tail of real work, and T60 in
-# particular.
-#
-# The floor is hard: SGLang refuses to start if max_total_num_tokens drops
-# below CONTEXT_LENGTH. That makes an over-aggressive value a loud failure at
-# boot rather than a silent one under load, so this is tuned by reading the
-# startup line, not by guessing:
-#   max_total_num_tokens=... context_len=...
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.40}"
+# Keep the full native window. The measured DFlash2 profile needs room for both
+# target and draft pools; 0.50 leaves over 40 GiB MemAvailable on this host.
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.50}"
 MEM_FRACTION_STATIC_SAFE_MAX=0.50
 DSPARK_BLOCK_SIZE="${DSPARK_BLOCK_SIZE:-7}"
 TORCH_COMPILE_MAX_BS="${TORCH_COMPILE_MAX_BS:-4}"
 CONTINUOUS_DECODE_STEPS="${CONTINUOUS_DECODE_STEPS:-2}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flashinfer}"
-# sglang renamed this flag: --mamba-scheduler-strategy became
-# --mamba-radix-cache-strategy. The old name still works on the newer image
-# but warns; the NEW name does not exist on the older image and is a hard
-# arg-parse failure there. Both images are kept on disk as each other's
-# revert path, so the name has to travel with the image rather than be
-# hardcoded. Default is the old name, which is what the base unit (still
-# pinned to the older image) needs.
-MAMBA_STRATEGY_FLAG="${MAMBA_STRATEGY_FLAG:---mamba-scheduler-strategy}"
+ENABLE_TORCH_COMPILE="${ENABLE_TORCH_COMPILE:-false}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-2048}"
+MAMBA_SSM_DTYPE="${MAMBA_SSM_DTYPE:-bfloat16}"
+MAMBA_STRATEGY="${MAMBA_STRATEGY:-extra_buffer_lazy}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-4}"
+CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-8}"
+DISABLE_FLASHINFER_AUTOTUNE="${DISABLE_FLASHINFER_AUTOTUNE:-true}"
+# This image exposes --sleep-on-idle; keep it on by default to reduce idle CPU
+# use while retaining an explicit false control for benchmark comparison.
+SLEEP_ON_IDLE="${SLEEP_ON_IDLE:-true}"
+# Keep the flag spelling paired with the image when explicitly rolling back.
+MAMBA_STRATEGY_FLAG="${MAMBA_STRATEGY_FLAG:---mamba-radix-cache-strategy}"
 CONTAINER_MEMORY="${CONTAINER_MEMORY:-100g}"
 
 # The checkpoint's own chat_template.jinja has three failure modes that an
@@ -141,6 +100,37 @@ case "$QWEN38_BROKER_RESIDENCY" in
   true|false) ;;
   *) echo "QWEN38_BROKER_RESIDENCY must be exactly true or false" >&2; exit 78 ;;
 esac
+case "$ENABLE_TORCH_COMPILE" in
+  true|false) ;;
+  *) echo "ENABLE_TORCH_COMPILE must be exactly true or false" >&2; exit 78 ;;
+esac
+if [[ "$ENABLE_TORCH_COMPILE" = "true" && ! "$TORCH_COMPILE_MAX_BS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TORCH_COMPILE_MAX_BS must be a positive integer when compile is enabled" >&2
+  exit 78
+fi
+case "$DISABLE_FLASHINFER_AUTOTUNE" in
+  true|false) ;;
+  *) echo "DISABLE_FLASHINFER_AUTOTUNE must be exactly true or false" >&2; exit 78 ;;
+esac
+case "$SLEEP_ON_IDLE" in
+  true|false) ;;
+  *) echo "SLEEP_ON_IDLE must be exactly true or false" >&2; exit 78 ;;
+esac
+case "$MAMBA_SSM_DTYPE" in
+  ''|float32|bfloat16) ;;
+  *) echo "MAMBA_SSM_DTYPE must be unset, float32, or bfloat16" >&2; exit 78 ;;
+esac
+case "$MAMBA_STRATEGY" in
+  extra_buffer|extra_buffer_lazy|no_buffer) ;;
+  *) echo "MAMBA_STRATEGY must be extra_buffer, extra_buffer_lazy, or no_buffer" >&2; exit 78 ;;
+esac
+for optional_positive_integer in CHUNKED_PREFILL_SIZE MAX_RUNNING_REQUESTS CUDA_GRAPH_MAX_BS; do
+  optional_value="${!optional_positive_integer}"
+  if [[ -n "$optional_value" && ! "$optional_value" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$optional_positive_integer must be unset or a positive integer" >&2
+    exit 78
+  fi
+done
 command -v docker >/dev/null 2>&1 || { echo "docker is required for the SGLang service" >&2; exit 78; }
 [[ -d "$HOST_HF_HOME" ]] || { echo "missing Hugging Face home: $HOST_HF_HOME" >&2; exit 78; }
 # Silently falling back to the checkpoint's own template would reintroduce all
@@ -233,15 +223,35 @@ server_args=(
   --context-length "$CONTEXT_LENGTH"
   --mem-fraction-static "$MEM_FRACTION_STATIC"
   --attention-backend "$ATTENTION_BACKEND"
-  "$MAMBA_STRATEGY_FLAG" extra_buffer
+  "$MAMBA_STRATEGY_FLAG" "$MAMBA_STRATEGY"
   --num-continuous-decode-steps "$CONTINUOUS_DECODE_STEPS"
-  --enable-torch-compile
-  --torch-compile-max-bs "$TORCH_COMPILE_MAX_BS"
   --trust-remote-code
   --tool-call-parser "$TOOL_CALL_PARSER"
   --reasoning-parser "$REASONING_PARSER"
   --chat-template "$CHAT_TEMPLATE_CONTAINER"
 )
+
+if [[ "$ENABLE_TORCH_COMPILE" = "true" ]]; then
+  server_args+=(--enable-torch-compile --torch-compile-max-bs "$TORCH_COMPILE_MAX_BS")
+fi
+if [[ -n "$CHUNKED_PREFILL_SIZE" ]]; then
+  server_args+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
+fi
+if [[ -n "$MAMBA_SSM_DTYPE" ]]; then
+  server_args+=(--mamba-ssm-dtype "$MAMBA_SSM_DTYPE")
+fi
+if [[ -n "$MAX_RUNNING_REQUESTS" ]]; then
+  server_args+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
+fi
+if [[ -n "$CUDA_GRAPH_MAX_BS" ]]; then
+  server_args+=(--cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS")
+fi
+if [[ "$DISABLE_FLASHINFER_AUTOTUNE" = "true" ]]; then
+  server_args+=(--disable-flashinfer-autotune)
+fi
+if [[ "$SLEEP_ON_IDLE" = "true" ]]; then
+  server_args+=(--sleep-on-idle)
+fi
 
 if [[ "${QWEN38_SPECULATIVE:-true}" = "true" ]]; then
   server_args+=(
