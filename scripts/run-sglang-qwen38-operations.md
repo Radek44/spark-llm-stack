@@ -60,5 +60,59 @@ current one-compute-process registration needs separate review for DFlash2.
 
 The official [Qwen cookbook](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)
 describes the GB10 DFlash2 options. Local measurements determine the selection.
-Long-context and permanent-service release/resume acceptance is recorded below
-when completed; the comparison alone does not establish that acceptance.
+The permanent-service acceptance below supplements this comparison.
+
+
+## Permanent-service acceptance and deployment
+
+The versioned launcher from commit `3cc535069de86a99f5ce37229b41d9165f0bf142` is deployed at
+`~/.local/share/spark-llm-stack/releases/3cc535069de86a99f5ce37229b41d9165f0bf142/scripts/run-sglang-qwen38`.
+The installed `zz-dflash2.conf` contains the measured serving controls;
+`zzz-base-qwen-launcher.conf` selects that launcher. The existing base unit,
+managed memory-limit override, canonical repository checkout, model caches,
+chat template and hosted routing/auth configuration were preserved.
+
+The permanent service passed all eight checks in six requests: readiness,
+multiple system messages plus a developer message, a nested structured tool
+call, consuming a tool result, and cold/warm long-context retrieval with token
+range checks. Both long requests used **234,815 input tokens** and
+returned all three exact values from near the start, middle and end. Cold TTFT
+was **308.405 seconds**; the cached repeat took
+**1.081 seconds** to its first token. Both completed normally
+with 73 output tokens. This tests synthetic retrieval, not general reasoning at
+that context length, and does not replace the earlier strict-format scores.
+The full 262,144-token window remains configured with auto-truncation disabled.
+
+The first service start took 230.78 seconds. Qwen then
+stopped and released its exact container, CUDA processes and canonical GPU lock.
+ComfyUI took ownership with an independently verified empty queue and matching
+CUDA/lock owner. Qwen restarted in 226.36 seconds and
+passed a fresh readiness response. Minimum MemAvailable across acceptance was
+46.62 GiB. Qwen was left active after independent
+backend, image, process, lock and source-pin verification.
+
+The first handoff attempt exhausted ComfyUI's existing two-start/30-minute
+limit after the benchmark switches. No model request was retried: full Qwen
+acceptance had already passed and the GPU was free. A separate recovery checked
+the exact inactive owners, completed responses, release evidence and systemd
+failure signature before clearing the exhausted Comfy counter once. The
+rate-limit policy remained unchanged. Both the failed attempt and recovery
+receipts are retained; the initial supervisor did not exit successfully.
+
+The existing LiteLLM router was restored on loopback port 8180. Its unchanged
+`qwen38` alias targets `http://127.0.0.1:8171/v1`; an actual routed arithmetic
+request passed in 0.681 seconds. No hosted route was called.
+Broker rollout/residency remain off. The switch proves stop/start handoff through
+the canonical GPU lock; it does not enable automatic broker scheduling.
+
+Validation: `scripts/validate-stack` exited 0 on the published implementation,
+including launcher argument/rejection checks, 21 lifecycle cases and the
+existing stack checks. Runtime receipts are under
+`~/.local/state/agentos/qwen-base-optimization-20260914/permanent-deploy`.
+
+The previous service override is saved there as `zz-dflash2.before.conf`.
+A rollback must stop Qwen first, restore that file, remove only the added
+`zzz-base-qwen-launcher.conf`, and reload systemd. The previous launcher had the
+observed compile startup failure, so restoring those historical bytes is not a
+promise of a working previous Qwen runtime; ComfyUI is the known alternate
+workload. Keep the versioned launcher while any installed override references it.
