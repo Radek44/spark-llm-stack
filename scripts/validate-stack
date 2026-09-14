@@ -13,6 +13,7 @@ fail() {
 for script in "$repo_root"/harden-llm-stack.sh "$repo_root"/llm-switch "$repo_root"/scripts/run-vllm-laguna "$repo_root"/scripts/run-sglang-qwen38 "$repo_root"/scripts/run-comfyui-canary; do
   bash -n "$script"
 done
+"$repo_root/scripts/test-run-sglang-qwen38.sh"
 PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/check-qwen-sglang-broker-lifecycle.py"
 python3 -m json.tool "$registry" >/dev/null
 python3 - "$registry" <<'PY'
