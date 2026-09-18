@@ -1,3 +1,26 @@
+# Optional persistent kernel cache
+
+`QWEN38_KERNEL_CACHE_DIR` opts into a host directory mounted at `/root/.cache`.
+It is empty by default, preserving the accepted ephemeral-cache profile. Use a
+separate directory for each pinned engine image; compiled artifacts are not a
+portable model cache and must not be shared with an untrusted writer.
+
+Create an absolute directory owned by the launching operator with mode `0700`
+before setting the variable. The launcher rejects missing directories, symlinks,
+non-private modes, and comma/newline mount syntax before invoking Docker. Model
+weights remain in `HOST_HF_HOME`; that mount and the chat template do not change.
+
+The September 17 candidate passes launcher argument/negative-path tests and
+`scripts/validate-stack`. Startup benefit is not established: the first live
+trial was rejected by the existing 110 GiB LLM admission threshold after
+background CPU workloads reduced available memory to about 106 GiB. No startup
+threshold is changed by this cache option.
+
+Compare empty-cache startup, repeated warm-cache startups, and an interleaved
+ephemeral control using identical image, model revisions, context and serving
+flags. Measure readiness separately from first-token latency. Kernel cache
+persistence does not preserve KV/prefix caches across model restarts.
+
 # Base Qwen serving on DGX Spark
 
 The selected profile serves the unchanged Qwen3.8-27B NVFP4 target with

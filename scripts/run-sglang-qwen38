@@ -93,6 +93,9 @@ CHAT_TEMPLATE_CONTAINER=/config/qwen38-chat-template.jinja
 
 HOST_HF_HOME="${HOST_HF_HOME:-$HOME/models/huggingface}"
 CONTAINER_HF_HOME="${CONTAINER_HF_HOME:-/models/huggingface}"
+# Opt-in, image-specific host cache for FlashInfer/Triton executable artifacts.
+# Empty preserves the original ephemeral-cache control for measured A/B runs.
+QWEN38_KERNEL_CACHE_DIR="${QWEN38_KERNEL_CACHE_DIR:-}"
 SGLANG_ENTRY="${SGLANG_ENTRY:-python3 -m sglang.launch_server}"
 
 [[ -x "$DGX_GPU_RUN" ]] || { echo "missing DGX GPU launcher: $DGX_GPU_RUN" >&2; exit 78; }
@@ -131,6 +134,19 @@ for optional_positive_integer in CHUNKED_PREFILL_SIZE MAX_RUNNING_REQUESTS CUDA_
     exit 78
   fi
 done
+if [[ -n "$QWEN38_KERNEL_CACHE_DIR" ]]; then
+  case "$QWEN38_KERNEL_CACHE_DIR" in
+    /*) ;;
+    *) echo "QWEN38_KERNEL_CACHE_DIR must be an absolute private directory" >&2; exit 78 ;;
+  esac
+  if [[ "$QWEN38_KERNEL_CACHE_DIR" = *','* || "$QWEN38_KERNEL_CACHE_DIR" = *$'\n'* ||
+        -L "$QWEN38_KERNEL_CACHE_DIR" || ! -d "$QWEN38_KERNEL_CACHE_DIR" ||
+        ! -O "$QWEN38_KERNEL_CACHE_DIR" ]] ||
+     [[ "$(stat -c '%a' -- "$QWEN38_KERNEL_CACHE_DIR")" != 700 ]]; then
+    echo "QWEN38_KERNEL_CACHE_DIR must be an owned, non-symlink directory with mode 700 and no commas/newlines" >&2
+    exit 78
+  fi
+fi
 command -v docker >/dev/null 2>&1 || { echo "docker is required for the SGLang service" >&2; exit 78; }
 [[ -d "$HOST_HF_HOME" ]] || { echo "missing Hugging Face home: $HOST_HF_HOME" >&2; exit 78; }
 # Silently falling back to the checkpoint's own template would reintroduce all
@@ -210,8 +226,11 @@ docker_args=(
   -v "$HOST_HF_HOME:$CONTAINER_HF_HOME"
   -v "$CHAT_TEMPLATE_HOST:$CHAT_TEMPLATE_CONTAINER:ro"
   -e "HF_HOME=$CONTAINER_HF_HOME"
-  "$SGLANG_IMAGE"
 )
+if [[ -n "$QWEN38_KERNEL_CACHE_DIR" ]]; then
+  docker_args+=(--mount "type=bind,src=$QWEN38_KERNEL_CACHE_DIR,dst=/root/.cache")
+fi
+docker_args+=("$SGLANG_IMAGE")
 
 server_args=(
   --model-path "$MODEL_ID"
