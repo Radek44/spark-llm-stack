@@ -106,3 +106,23 @@ for bad in CHUNKED_PREFILL_SIZE=0 MAX_RUNNING_REQUESTS=-1 CUDA_GRAPH_MAX_BS=1.5 
   grep -F "${bad%%=*} must be" "$test_root/invalid.err" >/dev/null
   [[ ! -e "$test_root/docker.log" ]] || { echo "invalid control reached docker" >&2; exit 1; }
 done
+
+# A kernel cache contains executable artifacts; only an explicit private
+# directory owned by the operator may be mounted into the container.
+mkdir -m 700 "$test_root/kernel-cache"
+mkdir -m 755 "$test_root/public-cache"
+ln -s "$test_root/kernel-cache" "$test_root/cache-link"
+for bad_cache in relative "$test_root/missing" "$test_root/template.jinja" "$test_root/public-cache" "$test_root/cache-link"; do
+  rm -f "$test_root/docker.log"
+  if QWEN38_KERNEL_CACHE_DIR="$bad_cache" run_launcher >"$test_root/cache.out" 2>&1; then
+    echo "invalid kernel cache unexpectedly accepted: $bad_cache" >&2; exit 1
+  else
+    code=$?
+    [[ "$code" = 78 ]] || { cat "$test_root/cache.out"; exit 1; }
+  fi
+  [[ ! -e "$test_root/docker.log" ]] || { echo "invalid cache reached docker" >&2; exit 1; }
+done
+QWEN38_KERNEL_CACHE_DIR="$test_root/kernel-cache" run_launcher
+assert_has "type=bind,src=$test_root/kernel-cache,dst=/root/.cache"
+QWEN38_KERNEL_CACHE_DIR= run_launcher
+assert_not_has "type=bind,src=$test_root/kernel-cache,dst=/root/.cache"
